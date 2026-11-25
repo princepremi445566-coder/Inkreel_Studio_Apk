@@ -146,7 +146,7 @@ object Mp4Exporter {
         val width = project.exportResolution.width
         val height = project.exportResolution.height
         val totalDurationMs = project.totalDurationMs
-        val totalFrames = ((totalDurationMs * FPS) / 1000L).toInt().coerceAtLeast(FPS)
+        val totalFrames = kotlin.math.ceil((totalDurationMs * FPS) / 1000.0).toInt().coerceAtLeast(FPS)
 
         val exportsDir = File(context.cacheDir, "exports").apply { mkdirs() }
         val fileName = "InkReel_${System.currentTimeMillis()}.mp4"
@@ -361,8 +361,8 @@ object Mp4Exporter {
             activeVideoEncoder.signalEndOfInputStream()
 
             // Bounded concurrent flush so EOS completes cleanly
-            val flushDeadlineMs = System.currentTimeMillis() + 8_000L
-            while ((!videoEosSeen || !audioEosSeen) && System.currentTimeMillis() < flushDeadlineMs) {
+            val flushDeadlineMs = System.currentTimeMillis() + maxOf(15_000L, totalDurationMs)
+            while ((!videoEosSeen || !audioEosSeen || !audioEosSent) && System.currentTimeMillis() < flushDeadlineMs) {
                 if (!audioEosSent) {
                     stepAudioFeed(maxChunks = 8, waitUs = 1_000L)
                 }
@@ -494,38 +494,65 @@ object Mp4Exporter {
         }
     }
 
-    private fun buildTimelineLipEnvelope(
+    internal fun buildTimelineLipEnvelope(
         project: ReelProject,
         shotAudioMap: Map<String, ByteArray>,
         totalFrames: Int
     ): FloatArray {
         val env = FloatArray(totalFrames)
-        var cursorFrame = 0
-        for (shot in project.shots) {
-            val shotFrames = ((shot.durationMs * FPS) / 1000L).toInt().coerceAtLeast(1)
-            val pcm = shotAudioMap[shot.shotId]
-            if (pcm != null && pcm.size >= 2 && shot.speaker != SpeakerSlot.SILENT) {
-                val speed = project.characterFor(shot.speaker)?.voiceSpeed ?: 1.0f
-                val samplesPerFrame = ((ProceduralAudioEngine.SAMPLE_RATE / FPS) * speed).toInt().coerceAtLeast(1)
-                val totalSamples = pcm.size / 2
-                for (f in 0 until shotFrames) {
-                    val dst = cursorFrame + f
-                    if (dst >= totalFrames) break
-                    val startS = f * samplesPerFrame
-                    val endS = (startS + samplesPerFrame).coerceAtMost(totalSamples)
-                    if (startS < endS) {
-                        var sumSq = 0.0
-                        for (i in startS until endS) {
-                            val lo = pcm[i * 2].toInt() and 0xFF
-                            val hi = pcm[i * 2 + 1].toInt()
-                            val v = ((hi shl 8) or lo).toShort().toFloat() / 32768f
-                            sumSq += v * v
-                        }
-                        env[dst] = (sqrt(sumSq / (endS - startS)).toFloat() * 4.2f).coerceIn(0f, 1f)
-                    }
+        val shots = project.shots
+        if (shots.isEmpty() || totalFrames <= 0) return env
+
+        val shotStarts = LongArray(shots.size)
+        var acc = 0L
+        for (i in shots.indices) {
+            shotStarts[i] = acc
+            acc += shots[i].durationMs
+        }
+        val shotsTotalMs = acc
+
+        for (frame in 0 until totalFrames) {
+            val playheadMs = (frame * 1000L) / FPS
+            if (project.outroDurationMs > 0L && playheadMs >= shotsTotalMs) {
+                env[frame] = 0f
+                continue
+            }
+            var shotIdx = shots.lastIndex
+            for (i in shots.indices) {
+                val end = shotStarts[i] + shots[i].durationMs
+                if (playheadMs < end) {
+                    shotIdx = i
+                    break
                 }
             }
-            cursorFrame += shotFrames
+            val shot = shots[shotIdx]
+            if (shot.speaker == SpeakerSlot.SILENT) {
+                env[frame] = 0f
+                continue
+            }
+            val pcm = shotAudioMap[shot.shotId]
+            if (pcm == null || pcm.size < 2) {
+                env[frame] = 0f
+                continue
+            }
+            val speed = (project.characterFor(shot.speaker)?.voiceSpeed ?: 1.0f).coerceIn(0.85f, 1.30f)
+            val localMs = (playheadMs - shotStarts[shotIdx]).coerceAtLeast(0L)
+            val startS = ((localMs / 1000.0) * ProceduralAudioEngine.SAMPLE_RATE * speed).toInt()
+            val windowSamples = ((ProceduralAudioEngine.SAMPLE_RATE / FPS) * speed).toInt().coerceAtLeast(1)
+            val totalSamples = pcm.size / 2
+            if (startS >= totalSamples) {
+                env[frame] = 0f
+                continue
+            }
+            val endS = (startS + windowSamples).coerceAtMost(totalSamples)
+            var sumSq = 0.0
+            for (i in startS until endS) {
+                val lo = pcm[i * 2].toInt() and 0xFF
+                val hi = pcm[i * 2 + 1].toInt()
+                val v = ((hi shl 8) or lo).toShort().toFloat() / 32768f
+                sumSq += v * v
+            }
+            env[frame] = (sqrt(sumSq / (endS - startS).coerceAtLeast(1)).toFloat() * 4.2f).coerceIn(0f, 1f)
         }
         return env
     }

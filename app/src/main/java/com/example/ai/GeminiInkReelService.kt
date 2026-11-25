@@ -6,6 +6,7 @@ import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.util.Base64
 import android.util.Log
+import com.example.audio.ProceduralAudioEngine
 import com.example.model.BgmMood
 import com.example.model.CameraFraming
 import com.example.model.CharacterActivity
@@ -22,6 +23,7 @@ import com.example.model.ReelLanguage
 import com.example.model.ReelProject
 import com.example.model.ReelShot
 import com.example.model.RoomSetting
+import com.example.model.ShotTransition
 import com.example.model.SocialMetaSuggestion
 import com.example.model.SpeakerSlot
 import com.example.model.VoiceCatalog
@@ -137,78 +139,61 @@ class GeminiInkReelService {
             return@withContext Result.failure(IllegalStateException("Please enter your Gemini API key first."))
         }
         try {
-            val blueprintNote = if (clonedBlueprint != null) {
-                """
-                Apply this cloned reference style blueprint:
-                - Summary: ${clonedBlueprint.summary}
-                - Target avg shot duration: ${clonedBlueprint.averageShotDurationMs}ms
-                - Pacing: ${clonedBlueprint.pacingStyle}
-                - Preferred framings: ${clonedBlueprint.recommendedFramings.joinToString(", ")}
-                - Comedy formula: ${clonedBlueprint.comedyFormula}
-                """.trimIndent()
-            } else {
-                ""
-            }
-
-            val freshTwistAngles = listOf(
-                "unexpected billing/receipt twist",
-                "caught on accidental speakerphone",
-                "literal misunderstanding of instructions",
-                "hidden camera goes viral mid-argument",
-                "role reversal where the junior outsmarts the senior",
-                "fake confidence exposed by an absurd prop",
-                "dramatic courtroom-style interrogation over a silly item",
-                "shortcut backfires and accidentally succeeds"
+            val bundle = ComedyScriptGenerator.buildPromptBundle(
+                niche = niche,
+                twist = twist,
+                language = language,
+                hook = hook,
+                clonedBlueprint = clonedBlueprint,
+                baseProject = baseProject,
+                requestedTopic = "random"
             )
-            val chosenAngle = freshTwistAngles[storyVariationCounter.getAndIncrement() % freshTwistAngles.size]
-            val recentNote = if (recentGeneratedTitles.isNotEmpty()) {
-                "Do NOT repeat these previous titles or plots: ${recentGeneratedTitles.joinToString(" | ")}."
-            } else {
-                ""
-            }
-
-            val prompt = """
-                Create a brand-new, unique 9:16 monochrome stickman comedy reel storyboard with 6 to 9 timed shots.
-                Niche: $niche
-                Comedy Twist Structure: $twist
-                Mandatory Fresh Comedy Angle: $chosenAngle
-                Language: $language (if Hinglish, write punchy conversational Hinglish in Latin script; if Hindi, write natural Hindi).
-                Optional Story Hook: ${hook.ifBlank { "Invent a totally original, hilarious premise specifically for '$niche' using the '$chosenAngle' angle." }}
-                $recentNote
-                $blueprintNote
-
-                Rules:
-                - Define exactly 3 characters (slots A, B, C) with distinct roles, gender (MALE or FEMALE — include female characters whenever natural like mom, sister, girlfriend, female boss/teacher/doctor/friend), matching voices, hair styles (use LONG_WAVY, PONYTAIL, BOB, BUN, or TWIN_BRAIDS for FEMALE), glasses, facial hair (NONE for FEMALE), and props.
-                - Make the video lively and action-packed! Assign varied CharacterActivity values across shots (such as WALKING_IN, DANCING, GYM_WORKOUT, PLAYING_CRICKET, COOKING_CHAI, STUDYING_WRITING, GAMING_PHONE, SLEEPING_SNORING, CLAPPING_CHEERING, CRYING_DRAMA, TAKING_SELFIE, DRIVING_RIDING, SWEEPING_CLEANING, TALKING) matching what the character is actually doing in that moment.
-                - Use dynamic comedy beats across shots: start with WIDE_DOORWAY or MEDIUM_TWO_SHOT, escalate with CLOSE_UP_A/B, DESK_SLAM, TIME_SKIP_CARD ("NEXT DAY" / "DAY 3"), PROP_DROP, SPLIT_PHONE_CALL, and finish with SLAPSTICK_CHASE or BONK_ENDING!
-                - Keep dialogue crisp, snappy, and genuinely funny (max 18 words per shot).
-                - Set appropriate ComicSfx per shot (DOOR_SLAM, DESK_SLAM, DRAMATIC_STING, CLIPBOARD_DROP, PUNCHLINE_BOOM, TIME_SKIP_WHOOSH, CARTOON_RUN, CARTOON_BONK, etc.).
-                - Pick the best matching RoomSetting and BgmMood.
-            """.trimIndent()
 
             val body = JSONObject().apply {
+                put("systemInstruction", JSONObject().apply {
+                    put("parts", JSONArray().put(JSONObject().put("text", bundle.systemPrompt)))
+                })
                 put("contents", JSONArray().put(JSONObject().apply {
-                    put("parts", JSONArray().put(JSONObject().put("text", prompt)))
+                    put("parts", JSONArray().put(JSONObject().put("text", bundle.userPrompt)))
                 }))
                 put("generationConfig", JSONObject().apply {
                     put("temperature", 1.05)
                     put("responseMimeType", "application/json")
-                    put("responseSchema", storyboardSchema())
+                    put("responseSchema", ComedyScriptGenerator.comedyScriptResponseSchema())
                 })
             }
 
             val responseJson = withTimeout(42_000L) {
                 callGeminiTextWithFallback(apiKey, body)
             }
-            val rawText = extractTextFromResponse(responseJson)
-            val parsed = parseStoryboardJson(
-                jsonText = rawText,
-                niche = niche,
-                twist = twist,
-                language = language,
-                clonedSummary = clonedBlueprint?.summary.orEmpty(),
-                baseProject = baseProject
-            )
+            val rawText = stripJsonCodeFences(extractTextFromResponse(responseJson))
+            val parsedJson = JSONObject(rawText)
+            val parsed = if (parsedJson.has("lines")) {
+                ComedyScriptGenerator.parseComedyScriptJson(
+                    jsonText = rawText,
+                    niche = niche,
+                    twist = twist,
+                    language = language,
+                    clonedSummary = clonedBlueprint?.summary.orEmpty(),
+                    baseProject = baseProject,
+                    fallbackTopic = bundle.topic
+                )
+            } else {
+                parseStoryboardJson(
+                    jsonText = rawText,
+                    niche = niche,
+                    twist = twist,
+                    language = language,
+                    clonedSummary = clonedBlueprint?.summary.orEmpty(),
+                    baseProject = baseProject
+                ).also { proj ->
+                    ComedyScriptGenerator.recordGenerated(
+                        topic = bundle.topic,
+                        title = proj.title,
+                        punchline = proj.shots.lastOrNull()?.dialogue.orEmpty()
+                    )
+                }
+            }
             rememberRecentTitle(parsed.title)
             Result.success(GenerationOutcome(parsed))
         } catch (e: CancellationException) {
@@ -283,16 +268,47 @@ class GeminiInkReelService {
                 callGeminiTextWithFallback(apiKey, body)
             }
             val rawText = extractTextFromResponse(responseJson)
-            val parsed = parseStoryboardJson(
+            val parsedRaw = parseStoryboardJson(
                 jsonText = rawText,
                 niche = "Custom Script",
                 twist = "Script Adaptation",
                 language = language,
                 clonedSummary = baseProject.clonedStyleSummary,
                 baseProject = baseProject
-            ).let { proj ->
-                if (settingHint != null) proj.copy(setting = settingHint) else proj
+            )
+            val inputNonEmptyLines = scriptText.lines().map { it.trim() }.filter { it.isNotEmpty() }.take(ReelProject.MAX_SHOTS)
+            val localBaseline = parseScriptLocally(scriptText, settingHint, language, baseProject)
+            val reconciledShots = if (parsedRaw.shots.size < inputNonEmptyLines.size) {
+                // Gemini merged or truncated lines: keep 1 scene per input line using localBaseline + any matching metadata
+                localBaseline.shots.mapIndexed { idx, baseShot ->
+                    val aiShot = parsedRaw.shots.getOrNull(idx)
+                    if (aiShot != null && baseShot.speaker != SpeakerSlot.SILENT) {
+                        baseShot.copy(
+                            framing = if (aiShot.framing != CameraFraming.TIME_SKIP_CARD) aiShot.framing else baseShot.framing,
+                            moodPose = aiShot.moodPose,
+                            activity = aiShot.activity,
+                            sticker = aiShot.sticker,
+                            sfx = if (aiShot.sfx != ComicSfx.NONE) aiShot.sfx else baseShot.sfx,
+                            roomOverride = if (settingHint == null) (aiShot.roomOverride ?: baseShot.roomOverride) else null,
+                            transition = if (aiShot.transition != ShotTransition.CUT) aiShot.transition else baseShot.transition
+                        )
+                    } else {
+                        baseShot
+                    }
+                }
+            } else {
+                parsedRaw.shots
             }
+            val effectiveSetting = settingHint ?: parsedRaw.setting
+            val distinctShots = enforceDistinctScenes(
+                shots = reconciledShots,
+                baseSetting = effectiveSetting,
+                respectSettingAsFixedRoom = (settingHint != null)
+            )
+            val parsed = parsedRaw.copy(
+                setting = effectiveSetting,
+                shots = distinctShots
+            )
             Result.success(parsed)
         } catch (e: CancellationException) {
             throw e
@@ -310,6 +326,12 @@ class GeminiInkReelService {
     ): ReelProject {
         val lines = scriptText.lines().map { it.trim() }.filter { it.isNotEmpty() }.take(ReelProject.MAX_SHOTS)
         val shots = mutableListOf<ReelShot>()
+        val manualRooms = mutableListOf<Boolean>()
+        val manualFramings = mutableListOf<Boolean>()
+        val manualActivities = mutableListOf<Boolean>()
+        val manualMoods = mutableListOf<Boolean>()
+        val manualTransitions = mutableListOf<Boolean>()
+
         val labelToSlot = linkedMapOf<String, SpeakerSlot>()
         val slotsOrder = listOf(SpeakerSlot.A, SpeakerSlot.B, SpeakerSlot.C)
         val detectedCharacters = baseProject.characters.toMutableList()
@@ -319,10 +341,21 @@ class GeminiInkReelService {
 
         val timeSkipRegex = Regex("^\\[(.*)]$")
         val speakerLineRegex = Regex("^([A-Za-z0-9_ ()'.-]{1,28})\\s*:\\s*(.+)$")
+        val inlineRoomRegex = Regex("\\[Room\\s*:\\s*([^\\]]+)]", RegexOption.IGNORE_CASE)
+        val inlineFramingRegex = Regex("\\[Framing\\s*:\\s*([^\\]]+)]", RegexOption.IGNORE_CASE)
+        val inlineMoodRegex = Regex("\\[Mood\\s*:\\s*([^\\]]+)]", RegexOption.IGNORE_CASE)
+        val inlineActivityRegex = Regex("\\[Activity\\s*:\\s*([^\\]]+)]", RegexOption.IGNORE_CASE)
+        val inlineTransitionRegex = Regex("\\[Transition\\s*:\\s*([^\\]]+)]", RegexOption.IGNORE_CASE)
 
-        for ((idx, line) in lines.withIndex()) {
-            val skipMatch = timeSkipRegex.matchEntire(line)
-            if (skipMatch != null) {
+        for ((idx, rawLine) in lines.withIndex()) {
+            val skipMatch = timeSkipRegex.matchEntire(rawLine)
+            val isInlineTagOnly = inlineRoomRegex.matches(rawLine) ||
+                inlineFramingRegex.matches(rawLine) ||
+                inlineMoodRegex.matches(rawLine) ||
+                inlineActivityRegex.matches(rawLine) ||
+                inlineTransitionRegex.matches(rawLine)
+
+            if (skipMatch != null && !isInlineTagOnly) {
                 shots.add(
                     ReelShot(
                         shotId = "shot_loc_$idx",
@@ -331,12 +364,44 @@ class GeminiInkReelService {
                         dialogue = "",
                         transitionCard = skipMatch.groupValues[1].ifBlank { "NEXT DAY" }.uppercase(),
                         moodPose = MoodPose.NEUTRAL,
+                        transition = ShotTransition.FLASH,
                         sfx = ComicSfx.TIME_SKIP_WHOOSH,
                         durationMs = 1500L
                     )
                 )
+                manualRooms.add(true)
+                manualFramings.add(true)
+                manualActivities.add(true)
+                manualMoods.add(true)
+                manualTransitions.add(true)
                 continue
             }
+
+            var line = rawLine
+            val explicitRoom = inlineRoomRegex.find(line)?.groupValues?.get(1)?.trim()?.let { raw ->
+                RoomSetting.entries.firstOrNull { it.name.equals(raw, true) || it.label.equals(raw, true) }
+            }
+            val explicitFraming = inlineFramingRegex.find(line)?.groupValues?.get(1)?.trim()?.let { raw ->
+                CameraFraming.entries.firstOrNull { it.name.equals(raw, true) || it.label.equals(raw, true) }
+            }
+            val explicitMood = inlineMoodRegex.find(line)?.groupValues?.get(1)?.trim()?.let { raw ->
+                MoodPose.entries.firstOrNull { it.name.equals(raw, true) || it.label.equals(raw, true) }
+            }
+            val explicitActivity = inlineActivityRegex.find(line)?.groupValues?.get(1)?.trim()?.let { raw ->
+                CharacterActivity.entries.firstOrNull { it.name.equals(raw, true) || it.label.equals(raw, true) }
+            }
+            val explicitTransition = inlineTransitionRegex.find(line)?.groupValues?.get(1)?.trim()?.let { raw ->
+                ShotTransition.entries.firstOrNull { it.name.equals(raw, true) || it.label.equals(raw, true) }
+            }
+
+            line = line
+                .replace(inlineRoomRegex, "")
+                .replace(inlineFramingRegex, "")
+                .replace(inlineMoodRegex, "")
+                .replace(inlineActivityRegex, "")
+                .replace(inlineTransitionRegex, "")
+                .trim()
+                .ifBlank { rawLine }
 
             val spkMatch = speakerLineRegex.matchEntire(line)
             val rawSpeaker = spkMatch?.groupValues?.get(1)?.trim().orEmpty()
@@ -387,47 +452,241 @@ class GeminiInkReelService {
 
             val wordCount = spoken.split(Regex("\\s+")).size
             val estimatedMs = (wordCount * 360L + 700L).coerceIn(1800L, 18000L)
-            val framing = when {
+            val inferredFraming = explicitFraming ?: when {
                 idx == 0 -> CameraFraming.WIDE_DOORWAY
-                idx == lines.lastIndex && spoken.contains("!") -> CameraFraming.CLOSE_UP_B
+                idx == lines.lastIndex && spoken.contains("!") -> CameraFraming.SLAPSTICK_CHASE
+                slot == SpeakerSlot.C -> CameraFraming.CLOSE_UP_C
                 slot == SpeakerSlot.A && idx % 3 == 1 -> CameraFraming.CLOSE_UP_A
                 slot == SpeakerSlot.B && idx % 3 == 2 -> CameraFraming.CLOSE_UP_B
+                idx % 4 == 1 -> CameraFraming.OVER_THE_SHOULDER
+                idx % 4 == 2 -> CameraFraming.SITTING_AT_DESK
                 else -> CameraFraming.MEDIUM_TWO_SHOT
             }
-            val mood = when {
+            val inferredMood = explicitMood ?: when {
                 spoken.contains("?!") -> MoodPose.SHOCKED
                 spoken.contains("!") -> MoodPose.ANGRY
                 spoken.contains("?") -> MoodPose.NERVOUS
-                else -> MoodPose.NEUTRAL
+                else -> MoodPose.entries[idx % MoodPose.entries.size]
             }
             val bubble = spoken.split(Regex("\\s+")).take(3).joinToString(" ").uppercase()
-            val activity = inferActivityFromText(spoken, idx, settingHint)
+            val inferredActivity = explicitActivity ?: inferActivityFromText(spoken, idx, explicitRoom ?: settingHint)
+            val inferredRoom = explicitRoom ?: settingHint
+            val inferredTransition = explicitTransition ?: when (idx % 4) {
+                0 -> ShotTransition.CUT
+                1 -> ShotTransition.WHIP_PAN
+                2 -> ShotTransition.ZOOM_PUNCH
+                else -> ShotTransition.FLASH
+            }
 
             shots.add(
                 ReelShot(
                     shotId = "shot_loc_${UUID.randomUUID().toString().take(4)}_$idx",
                     speaker = slot,
-                    framing = framing,
+                    framing = inferredFraming,
+                    roomOverride = inferredRoom,
+                    transition = inferredTransition,
                     dialogue = spoken,
                     speechBubble = bubble,
-                    moodPose = mood,
-                    activity = activity,
+                    moodPose = inferredMood,
+                    activity = inferredActivity,
                     sfx = if (idx == 0) ComicSfx.DOOR_OPEN else ComicSfx.NONE,
                     durationMs = estimatedMs
                 )
             )
+            manualRooms.add(explicitRoom != null)
+            manualFramings.add(explicitFraming != null)
+            manualActivities.add(explicitActivity != null)
+            manualMoods.add(explicitMood != null)
+            manualTransitions.add(explicitTransition != null)
         }
+
+        val resolvedBaseSetting = settingHint ?: baseProject.setting
+        val rawList = shots.ifEmpty { ReelProject.defaultShots() }
+        val distinctShots = enforceDistinctScenes(
+            shots = rawList,
+            baseSetting = resolvedBaseSetting,
+            respectSettingAsFixedRoom = (settingHint != null),
+            manualRooms = manualRooms,
+            manualFramings = manualFramings,
+            manualActivities = manualActivities,
+            manualMoods = manualMoods,
+            manualTransitions = manualTransitions
+        )
 
         return baseProject.copy(
             id = "",
-            title = "Script Reel (${shots.size} shots)",
+            title = "Script Reel (${distinctShots.size} shots)",
             language = language,
-            setting = settingHint ?: baseProject.setting,
+            setting = resolvedBaseSetting,
             characters = detectedCharacters,
-            shots = shots.ifEmpty { ReelProject.defaultShots() },
+            shots = distinctShots,
             createdAtMs = System.currentTimeMillis(),
             updatedAtMs = System.currentTimeMillis()
         )
+    }
+
+    /**
+     * Ensures every spoken scene gets a distinct room (unless manually pinned), camera framing,
+     * character activity, mood pose, and varied entry transition, never repeating the exact same
+     * combination or leaving consecutive spoken scenes visually identical.
+     */
+    internal fun enforceDistinctScenes(
+        shots: List<ReelShot>,
+        baseSetting: RoomSetting,
+        respectSettingAsFixedRoom: Boolean = false,
+        manualRooms: List<Boolean> = emptyList(),
+        manualFramings: List<Boolean> = emptyList(),
+        manualActivities: List<Boolean> = emptyList(),
+        manualMoods: List<Boolean> = emptyList(),
+        manualTransitions: List<Boolean> = emptyList()
+    ): List<ReelShot> {
+        if (shots.isEmpty()) return shots
+        val roomPool = listOf(
+            baseSetting,
+            RoomSetting.OFFICE,
+            RoomSetting.COFFEE_SHOP,
+            RoomSetting.STREET_PARK,
+            RoomSetting.LIVING_ROOM,
+            RoomSetting.GAMING_ROOM,
+            RoomSetting.KITCHEN,
+            RoomSetting.CLASSROOM,
+            RoomSetting.INTERVIEW_ROOM,
+            RoomSetting.GYM
+        ).distinct()
+        val framingPool = listOf(
+            CameraFraming.WIDE_DOORWAY,
+            CameraFraming.CLOSE_UP_B,
+            CameraFraming.OVER_THE_SHOULDER,
+            CameraFraming.DESK_SLAM,
+            CameraFraming.CLOSE_UP_A,
+            CameraFraming.SPLIT_PHONE_CALL,
+            CameraFraming.SITTING_AT_DESK,
+            CameraFraming.PROP_DROP,
+            CameraFraming.MEDIUM_TWO_SHOT,
+            CameraFraming.CLOSE_UP_C,
+            CameraFraming.SLAPSTICK_CHASE
+        )
+        val activityPool = CharacterActivity.entries.toList()
+        val moodPool = MoodPose.entries.filter { it != MoodPose.NEUTRAL } + MoodPose.NEUTRAL
+        val transitionPool = listOf(
+            ShotTransition.CUT,
+            ShotTransition.WHIP_PAN,
+            ShotTransition.ZOOM_PUNCH,
+            ShotTransition.FLASH
+        )
+
+        val result = mutableListOf<ReelShot>()
+        var prevRoom: RoomSetting? = null
+        var prevFraming: CameraFraming? = null
+        var prevActivity: CharacterActivity? = null
+        var prevMood: MoodPose? = null
+        var prevTransition: ShotTransition? = null
+
+        shots.forEachIndexed { idx, shot ->
+            if (shot.framing == CameraFraming.TIME_SKIP_CARD || shot.framing == CameraFraming.BONK_ENDING) {
+                result.add(shot)
+                return@forEachIndexed
+            }
+
+            val isManualRoom = manualRooms.getOrNull(idx) == true
+            val isManualFraming = manualFramings.getOrNull(idx) == true
+            val isManualActivity = manualActivities.getOrNull(idx) == true
+            val isManualMood = manualMoods.getOrNull(idx) == true
+            val isManualTransition = manualTransitions.getOrNull(idx) == true
+
+            val chosenRoom: RoomSetting? = when {
+                isManualRoom -> shot.roomOverride
+                respectSettingAsFixedRoom -> shot.roomOverride
+                shot.roomOverride != null && shot.roomOverride != prevRoom -> shot.roomOverride
+                else -> {
+                    var r = roomPool[idx % roomPool.size]
+                    if (r == prevRoom) {
+                        r = roomPool[(idx + 1) % roomPool.size]
+                    }
+                    r
+                }
+            }
+
+            var chosenFraming = when {
+                isManualFraming -> shot.framing
+                shot.framing != prevFraming && (idx == 0 || shot.framing != CameraFraming.MEDIUM_TWO_SHOT) -> shot.framing
+                else -> {
+                    var candidate = framingPool[idx % framingPool.size]
+                    if (shot.speaker == SpeakerSlot.C && candidate == CameraFraming.CLOSE_UP_A) {
+                        candidate = CameraFraming.CLOSE_UP_C
+                    } else if (shot.speaker == SpeakerSlot.A && candidate == CameraFraming.CLOSE_UP_B) {
+                        candidate = CameraFraming.CLOSE_UP_A
+                    }
+                    if (candidate == prevFraming) {
+                        candidate = framingPool[(idx + 1) % framingPool.size]
+                    }
+                    candidate
+                }
+            }
+            if (!isManualFraming && chosenFraming == prevFraming) {
+                chosenFraming = framingPool.firstOrNull { it != prevFraming } ?: chosenFraming
+            }
+
+            var chosenActivity = when {
+                isManualActivity -> shot.activity
+                shot.activity != prevActivity && shot.activity != CharacterActivity.TALKING -> shot.activity
+                else -> {
+                    val startOffset = idx % activityPool.size
+                    var candidate = activityPool[startOffset]
+                    if (candidate == prevActivity) {
+                        candidate = activityPool[(startOffset + 1) % activityPool.size]
+                    }
+                    candidate
+                }
+            }
+            if (!isManualActivity && chosenActivity == prevActivity) {
+                chosenActivity = activityPool.firstOrNull { it != prevActivity } ?: chosenActivity
+            }
+
+            var chosenMood = when {
+                isManualMood -> shot.moodPose
+                shot.moodPose != prevMood && shot.moodPose != MoodPose.NEUTRAL -> shot.moodPose
+                else -> {
+                    var candidate = moodPool[idx % moodPool.size]
+                    if (candidate == prevMood) {
+                        candidate = moodPool[(idx + 1) % moodPool.size]
+                    }
+                    candidate
+                }
+            }
+            if (!isManualMood && chosenMood == prevMood) {
+                chosenMood = moodPool.firstOrNull { it != prevMood } ?: chosenMood
+            }
+
+            val chosenTransition = when {
+                isManualTransition -> shot.transition
+                idx == 0 -> shot.transition
+                shot.transition != ShotTransition.CUT && shot.transition != prevTransition -> shot.transition
+                else -> {
+                    var candidate = transitionPool[idx % transitionPool.size]
+                    if (candidate == prevTransition) {
+                        candidate = transitionPool[(idx + 1) % transitionPool.size]
+                    }
+                    candidate
+                }
+            }
+
+            val updated = shot.copy(
+                roomOverride = chosenRoom,
+                framing = chosenFraming,
+                activity = chosenActivity,
+                moodPose = chosenMood,
+                transition = chosenTransition
+            )
+            result.add(updated)
+            prevRoom = chosenRoom ?: baseSetting
+            prevFraming = chosenFraming
+            prevActivity = chosenActivity
+            prevMood = chosenMood
+            prevTransition = chosenTransition
+        }
+
+        return result
     }
 
     private fun inferActivityFromText(text: String, idx: Int, setting: RoomSetting?): CharacterActivity {
@@ -528,7 +787,7 @@ class GeminiInkReelService {
             }
 
             val responseJson = withTimeout(60_000L) {
-                callGeminiTextWithFallback(apiKey, body)
+                callGeminiTextWithFallback(apiKey, body, kind = GeminiModels.ModelKind.VISION)
             }
             val json = JSONObject(extractTextFromResponse(responseJson))
             val framingsArr = json.optJSONArray("recommendedFramings") ?: JSONArray()
@@ -801,7 +1060,7 @@ class GeminiInkReelService {
             title = "$cleanBaseTitle (Part 2)",
             introHookBanner = "PART 2 IS WILDER!",
             outroText = "PART 3? DROP A COMMENT!",
-            shots = seqShots
+            shots = enforceDistinctScenes(seqShots, current.setting)
         )
     }
 
@@ -1101,6 +1360,139 @@ class GeminiInkReelService {
         )
     }
 
+    fun splitTextIntoTtsChunks(rawText: String, maxChunkChars: Int = 250): List<String> {
+        val cleaned = rawText.trim()
+        if (cleaned.isBlank()) return emptyList()
+        val limit = maxChunkChars.coerceAtLeast(40)
+        val out = mutableListOf<String>()
+
+        fun splitByWords(segment: String) {
+            val words = segment.trim().split(Regex("\\s+")).filter { it.isNotBlank() }
+            if (words.isEmpty()) return
+            val sb = StringBuilder()
+            for (w in words) {
+                if (w.length > limit) {
+                    if (sb.isNotEmpty()) {
+                        out.add(sb.toString().trim())
+                        sb.clear()
+                    }
+                    var start = 0
+                    while (start < w.length) {
+                        val end = minOf(start + limit, w.length)
+                        out.add(w.substring(start, end))
+                        start = end
+                    }
+                    continue
+                }
+                val nextLen = if (sb.isEmpty()) w.length else sb.length + 1 + w.length
+                if (nextLen > limit) {
+                    out.add(sb.toString().trim())
+                    sb.clear()
+                }
+                if (sb.isNotEmpty()) sb.append(' ')
+                sb.append(w)
+            }
+            if (sb.isNotEmpty()) {
+                out.add(sb.toString().trim())
+            }
+        }
+
+        val lines = cleaned.lines().map { it.trim() }.filter { it.isNotBlank() }
+        for (line in lines) {
+            if (line.length <= limit) {
+                out.add(line)
+                continue
+            }
+            val sentences = line.split(Regex("(?<=[.!?।])\\s+")).map { it.trim() }.filter { it.isNotBlank() }
+            for (sentence in sentences) {
+                if (sentence.length <= limit) {
+                    out.add(sentence)
+                    continue
+                }
+                val clauses = sentence.split(Regex("(?<=[,;:])\\s+")).map { it.trim() }.filter { it.isNotBlank() }
+                for (clause in clauses) {
+                    if (clause.length <= limit) {
+                        out.add(clause)
+                    } else {
+                        splitByWords(clause)
+                    }
+                }
+            }
+        }
+        return out
+    }
+
+    suspend fun synthesizeSpeechChunkGemini(
+        apiKey: String,
+        chunkText: String,
+        voiceName: String,
+        moodPose: MoodPose
+    ): Result<SynthesizedAudioResult> = withContext(Dispatchers.IO) {
+        if (apiKey.isBlank()) {
+            return@withContext Result.failure(IllegalStateException("Please enter your Gemini API key first."))
+        }
+        val trimmedChunk = chunkText.trim()
+        if (trimmedChunk.isBlank()) {
+            return@withContext Result.failure(IllegalArgumentException("Dialogue chunk is empty."))
+        }
+        val deliveryDirection = when (moodPose) {
+            MoodPose.ANGRY, MoodPose.FURIOUS -> "Say angrily and sharply"
+            MoodPose.NERVOUS, MoodPose.SWEATING -> "Say nervously and fast"
+            MoodPose.SHOCKED -> "Say in utter shock"
+            MoodPose.SMUG -> "Say smugly and playfully"
+            MoodPose.DEADPAN -> "Say completely deadpan"
+            else -> "Say expressively in a comedy skit"
+        }
+        val prompt = "$deliveryDirection: $trimmedChunk"
+
+        val body = JSONObject().apply {
+            put("contents", JSONArray().put(JSONObject().apply {
+                put("parts", JSONArray().put(JSONObject().put("text", prompt)))
+            }))
+            put("generationConfig", JSONObject().apply {
+                put("responseModalities", JSONArray().put("AUDIO"))
+                put("speechConfig", JSONObject().apply {
+                    put("voiceConfig", JSONObject().apply {
+                        put("prebuiltVoiceConfig", JSONObject().apply {
+                            put("voiceName", voiceName.ifBlank { "Puck" })
+                        })
+                    })
+                })
+            })
+        }
+
+        var lastError: Exception? = null
+        for (attempt in 0..2) {
+            try {
+                val responseJson = withTimeout(30_000L) {
+                    callGeminiWithModelDiscovery(
+                        apiKey = apiKey,
+                        kind = GeminiModels.ModelKind.TTS,
+                        requestBody = body,
+                        readTimeoutMs = 28_000
+                    )
+                }
+                val b64 = extractAudioBase64FromResponse(responseJson)
+                val decoded = Base64.decode(b64, Base64.DEFAULT)
+                val evenLen = decoded.size - (decoded.size % 2)
+                if (evenLen <= 0) {
+                    throw IllegalStateException("Gemini TTS returned empty audio.")
+                }
+                val pcm = if (evenLen == decoded.size) decoded else decoded.copyOf(evenLen)
+                val rawDurationMs = ((pcm.size.toDouble() / 48000.0) * 1000.0).toLong().coerceAtLeast(300L)
+                return@withContext Result.success(SynthesizedAudioResult(pcmBytes = pcm, rawDurationMs = rawDurationMs))
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                lastError = e
+                Log.w(TAG, "synthesizeSpeechChunkGemini attempt ${attempt + 1}/3 failed", e)
+                if (isNoInternetError(e)) break
+                if (e is GeminiHttpException && e.statusCode in listOf(400, 401, 403)) break
+            }
+        }
+        Result.failure(toUserFriendlyException(lastError ?: IllegalStateException("Gemini TTS failed.")))
+    }
+
     suspend fun synthesizeShotVoice(
         apiKey: String,
         dialogue: String,
@@ -1110,56 +1502,20 @@ class GeminiInkReelService {
         if (apiKey.isBlank()) {
             return@withContext Result.failure(IllegalStateException("Please enter your Gemini API key first."))
         }
-        if (dialogue.isBlank()) {
+        val chunks = splitTextIntoTtsChunks(dialogue, maxChunkChars = 250)
+        if (chunks.isEmpty()) {
             return@withContext Result.failure(IllegalArgumentException("Dialogue is empty."))
         }
         try {
-            val deliveryDirection = when (moodPose) {
-                MoodPose.ANGRY, MoodPose.FURIOUS -> "Say angrily and sharply"
-                MoodPose.NERVOUS, MoodPose.SWEATING -> "Say nervously and fast"
-                MoodPose.SHOCKED -> "Say in utter shock"
-                MoodPose.SMUG -> "Say smugly and playfully"
-                MoodPose.DEADPAN -> "Say completely deadpan"
-                else -> "Say expressively in a comedy skit"
+            val chunkPcms = mutableListOf<ByteArray>()
+            for (chunk in chunks) {
+                val res = synthesizeSpeechChunkGemini(apiKey, chunk, voiceName, moodPose)
+                val audio = res.getOrElse { return@withContext Result.failure(it) }
+                chunkPcms.add(audio.pcmBytes)
             }
-            val prompt = "$deliveryDirection: $dialogue"
-
-            val body = JSONObject().apply {
-                put("contents", JSONArray().put(JSONObject().apply {
-                    put("parts", JSONArray().put(JSONObject().put("text", prompt)))
-                }))
-                put("generationConfig", JSONObject().apply {
-                    put("responseModalities", JSONArray().put("AUDIO"))
-                    put("speechConfig", JSONObject().apply {
-                        put("voiceConfig", JSONObject().apply {
-                            put("prebuiltVoiceConfig", JSONObject().apply {
-                                put("voiceName", voiceName.ifBlank { "Puck" })
-                            })
-                        })
-                    })
-                })
-            }
-
-            val responseJson = withTimeout(16_000L) {
-                try {
-                    callGeminiRest(apiKey, preferredTtsModel, body, readTimeoutMs = 14_000)
-                } catch (e: Exception) {
-                    val suggested = Regex("models/(gemini-[a-zA-Z0-9._-]+)").find(e.message.orEmpty())?.groupValues?.getOrNull(1)
-                    if (!suggested.isNullOrBlank() && suggested != preferredTtsModel &&
-                        (suggested.contains("tts", ignoreCase = true) || e.message.orEmpty().contains("no longer available", ignoreCase = true))
-                    ) {
-                        val retryRes = callGeminiRest(apiKey, suggested, body, readTimeoutMs = 14_000)
-                        preferredTtsModel = suggested
-                        retryRes
-                    } else {
-                        throw e
-                    }
-                }
-            }
-            val b64 = extractAudioBase64FromResponse(responseJson)
-            val pcm = Base64.decode(b64, Base64.DEFAULT)
-            val rawDurationMs = ((pcm.size.toDouble() / 48000.0) * 1000.0).toLong().coerceAtLeast(700L)
-            Result.success(SynthesizedAudioResult(pcmBytes = pcm, rawDurationMs = rawDurationMs))
+            val combined = ProceduralAudioEngine.concatenatePcm24kMono(chunkPcms, gapMs = 200L)
+            val rawDurationMs = ((combined.size.toDouble() / 48000.0) * 1000.0).toLong().coerceAtLeast(700L)
+            Result.success(SynthesizedAudioResult(pcmBytes = combined, rawDurationMs = rawDurationMs))
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
@@ -1194,10 +1550,15 @@ class GeminiInkReelService {
             msg.contains("HTTP 500", ignoreCase = true)
     }
 
-    private fun toUserFriendlyException(e: Exception): Exception {
+    internal fun toUserFriendlyException(e: Exception): Exception {
         if (isNoInternetError(e)) {
             return IllegalStateException(
                 "No internet connection. Check your network and try again. (Script Mode & Sample Scripts work offline!)"
+            )
+        }
+        if (GeminiModels.isModelNotFoundError(e)) {
+            return IllegalStateException(
+                "The AI model is currently unavailable (HTTP 404). Please try again in a moment."
             )
         }
         if (e is GeminiHttpException) {
@@ -1208,7 +1569,10 @@ class GeminiInkReelService {
                 429 -> IllegalStateException(
                     "Gemini API rate limit reached (HTTP 429). Please wait a moment or check your quota."
                 )
-                else -> IllegalStateException(e.message)
+                in 500..599 -> IllegalStateException(
+                    "Gemini servers are temporarily busy (HTTP ${e.statusCode}). Please try again shortly."
+                )
+                else -> IllegalStateException("Gemini request failed (HTTP ${e.statusCode}). Please try again.")
             }
         }
         val msg = e.message.orEmpty()
@@ -1240,49 +1604,94 @@ class GeminiInkReelService {
             if (e.statusCode in listOf(400, 401, 403, 429)) return false
             return e.statusCode in listOf(404, 500, 502, 503, 504)
         }
+        if (GeminiModels.isModelNotFoundError(e)) return true
         val msg = e.message.orEmpty()
-        return msg.contains("no longer available", ignoreCase = true) ||
-            msg.contains("not found", ignoreCase = true) ||
-            msg.contains("HTTP 404", ignoreCase = true) ||
-            msg.contains("use models/", ignoreCase = true) ||
-            msg.contains("high demand", ignoreCase = true) ||
+        return msg.contains("high demand", ignoreCase = true) ||
             msg.contains("overloaded", ignoreCase = true) ||
             msg.contains("unavailable", ignoreCase = true) ||
             msg.contains("timeout", ignoreCase = true) ||
             e is SocketTimeoutException
     }
 
-    private fun callGeminiTextWithFallback(apiKey: String, requestBody: JSONObject): JSONObject {
-        val tried = linkedSetOf<String>()
-        val queue = ArrayDeque(
-            listOf(
-                preferredTextModel,
-                TEXT_MODEL,
-                "gemini-2.5-flash",
-                "gemini-2.5-flash-lite"
-            )
+    private fun callGeminiTextWithFallback(
+        apiKey: String,
+        requestBody: JSONObject,
+        kind: GeminiModels.ModelKind = GeminiModels.ModelKind.TEXT
+    ): JSONObject {
+        return callGeminiWithModelDiscovery(
+            apiKey = apiKey,
+            kind = kind,
+            requestBody = requestBody,
+            readTimeoutMs = 20_000
         )
+    }
+
+    private fun callGeminiWithModelDiscovery(
+        apiKey: String,
+        kind: GeminiModels.ModelKind,
+        requestBody: JSONObject,
+        readTimeoutMs: Int = 24_000
+    ): JSONObject {
+        val tried = linkedSetOf<String>()
+        val queue = ArrayDeque(GeminiModels.candidatesFor(kind))
         var lastError: Exception? = null
+        var listModelsAttempted = false
 
         while (queue.isNotEmpty()) {
             val model = queue.removeFirst()
             if (!tried.add(model)) continue
             try {
-                val res = callGeminiRest(apiKey, model, requestBody, readTimeoutMs = 15_000)
-                preferredTextModel = model
+                val res = callGeminiRest(apiKey, model, requestBody, readTimeoutMs = readTimeoutMs)
+                GeminiModels.cacheModel(kind, model)
                 return res
             } catch (e: Exception) {
                 lastError = e
                 if (!shouldTryNextModel(e)) {
                     throw e
                 }
-                val suggested = Regex("models/(gemini-[a-zA-Z0-9._-]+)").find(e.message.orEmpty())?.groupValues?.getOrNull(1)
-                if (!suggested.isNullOrBlank() && !tried.contains(suggested)) {
-                    queue.addFirst(suggested)
+                if (GeminiModels.isModelNotFoundError(e) && !listModelsAttempted) {
+                    listModelsAttempted = true
+                    val discovered = runCatching {
+                        val listJson = fetchAvailableModels(apiKey)
+                        GeminiModels.pickBestModelFromListModels(listJson, kind, excludeModels = tried)
+                    }.getOrNull()
+                    if (!discovered.isNullOrBlank() && !tried.contains(discovered)) {
+                        tried.add(discovered)
+                        try {
+                            val retryRes = callGeminiRest(apiKey, discovered, requestBody, readTimeoutMs = readTimeoutMs)
+                            GeminiModels.cacheModel(kind, discovered)
+                            return retryRes
+                        } catch (retryErr: Exception) {
+                            lastError = retryErr
+                            if (!shouldTryNextModel(retryErr)) {
+                                throw retryErr
+                            }
+                        }
+                    }
                 }
             }
         }
         throw lastError ?: IllegalStateException("Gemini API request failed.")
+    }
+
+    private fun fetchAvailableModels(apiKey: String): JSONObject {
+        val url = URL(GeminiModels.listModelsUrl(apiKey))
+        val conn = (url.openConnection() as HttpURLConnection).apply {
+            requestMethod = "GET"
+            connectTimeout = 10_000
+            readTimeout = 12_000
+        }
+        return try {
+            val code = conn.responseCode
+            val stream = if (code in 200..299) conn.inputStream else conn.errorStream
+            val text = stream?.bufferedReader()?.use { it.readText() }.orEmpty()
+            if (code !in 200..299) {
+                throw GeminiHttpException(code, "ListModels HTTP $code")
+            }
+            JSONObject(text)
+        } finally {
+            conn.disconnect()
+        }
     }
 
     private fun callGeminiRest(
@@ -1291,7 +1700,7 @@ class GeminiInkReelService {
         requestBody: JSONObject,
         readTimeoutMs: Int = 24_000
     ): JSONObject {
-        val url = URL("https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent?key=${apiKey.trim()}")
+        val url = URL(GeminiModels.generateContentUrl(model, apiKey))
         val conn = (url.openConnection() as HttpURLConnection).apply {
             requestMethod = "POST"
             setRequestProperty("Content-Type", "application/json; charset=UTF-8")
@@ -1397,6 +1806,14 @@ class GeminiInkReelService {
                 put("type", "STRING")
                 put("enum", JSONArray(CameraFraming.entries.map { it.name }))
             })
+            put("roomOverride", JSONObject().apply {
+                put("type", "STRING")
+                put("enum", JSONArray(RoomSetting.entries.map { it.name }))
+            })
+            put("transition", JSONObject().apply {
+                put("type", "STRING")
+                put("enum", JSONArray(ShotTransition.entries.map { it.name }))
+            })
             put("dialogue", JSONObject().put("type", "STRING"))
             put("speechBubble", JSONObject().put("type", "STRING"))
             put("transitionCard", JSONObject().put("type", "STRING"))
@@ -1495,13 +1912,20 @@ class GeminiInkReelService {
             )
         }.take(3).ifEmpty { ReelProject.defaultCast() }
 
+        val setting = RoomSetting.fromRaw(json.optString("setting"))
         val shotsArr = json.optJSONArray("shots") ?: JSONArray()
-        val shots = (0 until shotsArr.length()).map { idx ->
+        val parsedShots = (0 until shotsArr.length()).map { idx ->
             val obj = shotsArr.getJSONObject(idx)
+            val rawRoom = obj.optString("roomOverride", "")
+            val parsedRoom = RoomSetting.entries.firstOrNull { it.name == rawRoom }
+            val rawTrans = obj.optString("transition", "")
+            val parsedTrans = ShotTransition.entries.firstOrNull { it.name == rawTrans } ?: ShotTransition.CUT
             ReelShot(
                 shotId = "shot_${UUID.randomUUID().toString().take(6)}_$idx",
                 speaker = SpeakerSlot.fromRaw(obj.optString("speaker")),
                 framing = CameraFraming.fromRaw(obj.optString("framing")),
+                roomOverride = parsedRoom,
+                transition = parsedTrans,
                 dialogue = obj.optString("dialogue", ""),
                 speechBubble = obj.optString("speechBubble", ""),
                 transitionCard = obj.optString("transitionCard", ""),
@@ -1513,6 +1937,7 @@ class GeminiInkReelService {
                 audioSourceLabel = "Not Voiced"
             )
         }.take(ReelProject.MAX_SHOTS).ifEmpty { ReelProject.defaultShots() }
+        val shots = enforceDistinctScenes(parsedShots, setting)
 
         return baseProject.copy(
             id = "",
@@ -1523,7 +1948,7 @@ class GeminiInkReelService {
             niche = niche,
             twistStructure = twist,
             language = language,
-            setting = RoomSetting.fromRaw(json.optString("setting")),
+            setting = setting,
             bgmMood = BgmMood.fromRaw(json.optString("bgmMood")),
             clonedStyleSummary = clonedSummary,
             characters = characters,
@@ -1747,7 +2172,9 @@ class GeminiInkReelService {
             )
         )
 
+        val distinctShots = enforceDistinctScenes(shots, room)
         rememberRecentTitle(picked.title)
+        ComedyScriptGenerator.recordGenerated(niche, picked.title, picked.s7)
 
         return baseProject.copy(
             id = "",
@@ -1761,7 +2188,7 @@ class GeminiInkReelService {
             bgmMood = bgm,
             clonedStyleSummary = clonedSummary,
             characters = cast,
-            shots = shots,
+            shots = distinctShots,
             createdAtMs = System.currentTimeMillis(),
             updatedAtMs = System.currentTimeMillis()
         )
@@ -2395,12 +2822,6 @@ class GeminiInkReelService {
 
     companion object {
         private const val TAG = "GeminiInkReelService"
-        private const val TEXT_MODEL = "gemini-2.5-flash"
-        private const val TTS_MODEL = "gemini-2.5-flash-preview-tts"
-        @Volatile
-        private var preferredTextModel = TEXT_MODEL
-        @Volatile
-        private var preferredTtsModel = TTS_MODEL
         private val storyVariationCounter = java.util.concurrent.atomic.AtomicInteger(0)
         private val recentGeneratedTitles = ArrayDeque<String>()
     }

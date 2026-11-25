@@ -335,6 +335,15 @@ fun InkReelStudioScreen(
                             color = StudioCrimson,
                             modifier = Modifier.weight(1f)
                         )
+                        val firstFailedId = state.failedVoiceShotIds.keys.firstOrNull()
+                        if (firstFailedId != null) {
+                            TextButton(
+                                onClick = { viewModel.revoiceShot(firstFailedId) },
+                                modifier = Modifier.testTag("banner_retry_voice_button")
+                            ) {
+                                Text("Retry", color = StudioCrimson)
+                            }
+                        }
                         TextButton(onClick = { viewModel.dismissBanners() }) {
                             Text("Dismiss", color = StudioCrimson)
                         }

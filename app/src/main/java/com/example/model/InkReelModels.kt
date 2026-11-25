@@ -555,7 +555,7 @@ data class ReelShot(
         put("activity", activity.name)
         put("sticker", sticker.name)
         put("sfx", sfx.name)
-        put("durationMs", durationMs.coerceIn(700L, 30000L))
+        put("durationMs", durationMs.coerceIn(700L, 600_000L))
         put("audioSourceLabel", audioSourceLabel)
         put("sfxTiming", sfxTiming.name)
         put("particles", particles.name)
@@ -584,7 +584,7 @@ data class ReelShot(
                 activity = CharacterActivity.fromRaw(obj.optString("activity")),
                 sticker = MemeSticker.fromRaw(obj.optString("sticker")),
                 sfx = ComicSfx.fromRaw(obj.optString("sfx")),
-                durationMs = obj.optLong("durationMs", 2600L).coerceIn(700L, 30000L),
+                durationMs = obj.optLong("durationMs", 2600L).coerceIn(700L, 600_000L),
                 audioSourceLabel = obj.optString("audioSourceLabel", "Not Voiced"),
                 sfxTiming = SfxTiming.fromRaw(obj.optString("sfxTiming")),
                 particles = ParticleOverlay.fromRaw(obj.optString("particles")),
@@ -662,7 +662,7 @@ data class ReelProject(
         get() = shots.sumOf { it.durationMs }.coerceAtLeast(1000L)
 
     val outroDurationMs: Long
-        get() = if (enableOutro && outroText.isNotBlank()) 1700L else 0L
+        get() = if (enableOutro && outroText.isNotBlank()) 2000L else 0L
 
     val totalDurationMs: Long
         get() = shotsDurationMs + outroDurationMs
@@ -798,6 +798,7 @@ data class ReelProject(
                 shotId = "s1",
                 speaker = SpeakerSlot.A,
                 framing = CameraFraming.WIDE_DOORWAY,
+                transition = ShotTransition.CUT,
                 dialogue = "Alright class, submit your math homework right now!",
                 speechBubble = "HOMEWORK NOW!",
                 moodPose = MoodPose.ANGRY,
@@ -809,6 +810,8 @@ data class ReelProject(
                 shotId = "s2",
                 speaker = SpeakerSlot.B,
                 framing = CameraFraming.CLOSE_UP_B,
+                roomOverride = RoomSetting.LIVING_ROOM,
+                transition = ShotTransition.WHIP_PAN,
                 dialogue = "Sir, my dog ate my notebook... and then downloaded PDF proof.",
                 speechBubble = "DOG ATE IT!",
                 moodPose = MoodPose.SWEATING,
@@ -820,9 +823,12 @@ data class ReelProject(
                 shotId = "s3",
                 speaker = SpeakerSlot.A,
                 framing = CameraFraming.DESK_SLAM,
+                roomOverride = RoomSetting.OFFICE,
+                transition = ShotTransition.ZOOM_PUNCH,
                 dialogue = "You told me that exact excuse on Monday!",
                 speechBubble = "AGAIN?!",
                 moodPose = MoodPose.FURIOUS,
+                activity = CharacterActivity.STUDYING_WRITING,
                 sfx = ComicSfx.DESK_SLAM,
                 durationMs = 2400L
             ),
@@ -830,6 +836,7 @@ data class ReelProject(
                 shotId = "s4",
                 speaker = SpeakerSlot.SILENT,
                 framing = CameraFraming.TIME_SKIP_CARD,
+                transition = ShotTransition.FLASH,
                 dialogue = "",
                 transitionCard = "NEXT DAY",
                 moodPose = MoodPose.NEUTRAL,
@@ -840,6 +847,8 @@ data class ReelProject(
                 shotId = "s5",
                 speaker = SpeakerSlot.B,
                 framing = CameraFraming.SITTING_AT_DESK,
+                roomOverride = RoomSetting.CLASSROOM,
+                transition = ShotTransition.WHIP_PAN,
                 dialogue = "Sir, good news! Today I brought the dog instead. Ask him.",
                 speechBubble = "MEET TOMMY!",
                 moodPose = MoodPose.SMUG,
@@ -852,9 +861,12 @@ data class ReelProject(
                 shotId = "s6",
                 speaker = SpeakerSlot.A,
                 framing = CameraFraming.PROP_DROP,
+                roomOverride = RoomSetting.COFFEE_SHOP,
+                transition = ShotTransition.ZOOM_PUNCH,
                 dialogue = "Wait... why is the dog holding a calculator?!",
                 speechBubble = "WHAT?!",
                 moodPose = MoodPose.SHOCKED,
+                activity = CharacterActivity.TAKING_SELFIE,
                 sticker = MemeSticker.QUESTION_MARKS,
                 sfx = ComicSfx.CLIPBOARD_DROP,
                 durationMs = 2500L
@@ -863,9 +875,12 @@ data class ReelProject(
                 shotId = "s7",
                 speaker = SpeakerSlot.B,
                 framing = CameraFraming.SLAPSTICK_CHASE,
+                roomOverride = RoomSetting.STREET_PARK,
+                transition = ShotTransition.WHIP_PAN,
                 dialogue = "RUN TOMMY! HE FOUND OUT YOU FAILED ALGEBRA TOO!",
                 speechBubble = "RUN!!",
                 moodPose = MoodPose.NERVOUS,
+                activity = CharacterActivity.DANCING,
                 sfx = ComicSfx.CARTOON_RUN,
                 durationMs = 2400L
             ),
@@ -873,6 +888,8 @@ data class ReelProject(
                 shotId = "s8",
                 speaker = SpeakerSlot.SILENT,
                 framing = CameraFraming.BONK_ENDING,
+                roomOverride = RoomSetting.CLASSROOM,
+                transition = ShotTransition.FLASH,
                 dialogue = "BONK!",
                 speechBubble = "BONK!",
                 moodPose = MoodPose.SHOCKED,

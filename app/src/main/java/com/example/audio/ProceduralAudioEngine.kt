@@ -20,8 +20,10 @@ import com.example.model.VoiceEffect
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import java.io.ByteArrayOutputStream
 import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.exp
@@ -397,6 +399,35 @@ object ProceduralAudioEngine {
     }
 
     /**
+     * Concatenates multiple 24kHz 16-bit mono PCM chunks in exact order with a clean silence gap
+     * between chunks, enforcing even-byte sample alignment and flushing the output stream.
+     */
+    fun concatenatePcm24kMono(chunks: List<ByteArray>, gapMs: Long = 200L): ByteArray {
+        val valid = chunks.filter { it.size >= 2 }
+        if (valid.isEmpty()) return ByteArray(0)
+        if (valid.size == 1) {
+            val single = valid[0]
+            val evenLen = single.size - (single.size % 2)
+            return if (evenLen == single.size) single else single.copyOf(evenLen)
+        }
+        val gapSamples = ((gapMs.coerceIn(0L, 1000L) / 1000.0) * SAMPLE_RATE).toInt()
+        val gapBytes = ByteArray(gapSamples * 2)
+        val baos = ByteArrayOutputStream()
+        for (i in valid.indices) {
+            val chunk = valid[i]
+            val evenLen = chunk.size - (chunk.size % 2)
+            if (evenLen > 0) {
+                baos.write(chunk, 0, evenLen)
+            }
+            if (i < valid.lastIndex && gapBytes.isNotEmpty()) {
+                baos.write(gapBytes)
+            }
+        }
+        baos.flush()
+        return baos.toByteArray()
+    }
+
+    /**
      * Last-resort expressive cartoon speech synthesizer at 24kHz 16-bit mono PCM when both
      * cloud TTS and device TextToSpeech engines return empty audio or lack offline language packs.
      * Shapes syllable pulses with vowel formants, pitch inflection, and mood pacing.
@@ -407,7 +438,7 @@ object ProceduralAudioEngine {
         moodPose: MoodPose
     ): SynthesizedAudioResult {
         val words = text.trim().split(Regex("\\s+")).filter { it.isNotBlank() }
-        val durationMs = ((words.size.coerceAtLeast(1) * 320L) + 450L).coerceIn(1100L, 12000L)
+        val durationMs = ((words.size.coerceAtLeast(1) * 320L) + 450L).coerceIn(1100L, 60000L)
         val totalSamples = ((durationMs / 1000.0) * SAMPLE_RATE).toInt().coerceAtLeast(SAMPLE_RATE)
         val out = ByteArray(totalSamples * 2)
 
@@ -517,11 +548,19 @@ class LiveReelAudioPlayer {
                 audioTrack.play()
                 var pos = byteOffset
                 val chunk = 4096
+                var zeroWrites = 0
                 while (isActive && pos < mixedPcm.size) {
                     val count = minOf(chunk, mixedPcm.size - pos)
                     val written = audioTrack.write(mixedPcm, pos, count)
-                    if (written <= 0) break
-                    pos += written
+                    if (written < 0) break
+                    if (written == 0) {
+                        zeroWrites++
+                        if (zeroWrites > 80) break
+                        delay(5L)
+                    } else {
+                        zeroWrites = 0
+                        pos += written
+                    }
                 }
             } catch (e: Exception) {
                 Log.w("LiveReelAudioPlayer", "Playback interrupted: ${e.message}")
@@ -541,7 +580,7 @@ class LiveReelAudioPlayer {
         playFromMs(scope, pcm, 0L)
     }
 
-    fun stop() {
+    fun stop(flushImmediate: Boolean = true) {
         playbackJob?.cancel()
         playbackJob = null
         val t = track
@@ -549,8 +588,10 @@ class LiveReelAudioPlayer {
         if (t != null) {
             runCatching {
                 if (t.playState == AudioTrack.PLAYSTATE_PLAYING) {
-                    t.pause()
-                    t.flush()
+                    if (flushImmediate) {
+                        t.pause()
+                        t.flush()
+                    }
                     t.stop()
                 }
                 t.release()

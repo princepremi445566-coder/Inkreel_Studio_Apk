@@ -265,19 +265,33 @@ fun CenterStagePanel(
                             verticalArrangement = Arrangement.spacedBy(8.dp)
                         ) {
                             Text(
-                                text = if (state.isGeneratingReel) {
-                                    "Generating stickman video & storyboard..."
-                                } else {
-                                    "Preparing character voices..."
+                                text = when {
+                                    state.isGeneratingReel ->
+                                        "Generating stickman video & storyboard..."
+                                    state.voiceProgressTotal > 0 ->
+                                        "Voice ${state.voiceProgressCurrent}/${state.voiceProgressTotal} — Preparing character voices..."
+                                    else ->
+                                        "Preparing character voices..."
                                 },
                                 style = MaterialTheme.typography.titleSmall,
                                 color = InkBlack
                             )
-                            LinearProgressIndicator(
-                                modifier = Modifier.fillMaxWidth().height(4.dp),
-                                color = InkBlack,
-                                trackColor = HairlineBorder
-                            )
+                            if (!state.isGeneratingReel && state.voiceProgressTotal > 0) {
+                                LinearProgressIndicator(
+                                    progress = {
+                                        (state.voiceProgressCurrent.toFloat() / state.voiceProgressTotal.toFloat()).coerceIn(0f, 1f)
+                                    },
+                                    modifier = Modifier.fillMaxWidth().height(4.dp).testTag("voice_progress_bar"),
+                                    color = InkBlack,
+                                    trackColor = HairlineBorder
+                                )
+                            } else {
+                                LinearProgressIndicator(
+                                    modifier = Modifier.fillMaxWidth().height(4.dp),
+                                    color = InkBlack,
+                                    trackColor = HairlineBorder
+                                )
+                            }
                         }
                     }
                 } else {

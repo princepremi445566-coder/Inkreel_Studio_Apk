@@ -287,7 +287,12 @@ private fun ShotsDirectorTab(
             if (state.isSynthesizingAllVoices) {
                 CircularProgressIndicator(modifier = Modifier.size(16.dp), color = StudioWhite, strokeWidth = 2.dp)
                 Spacer(Modifier.size(6.dp))
-                Text("Voicing...", style = MaterialTheme.typography.bodySmall)
+                val progressText = if (state.voiceProgressTotal > 0) {
+                    "Voice ${state.voiceProgressCurrent}/${state.voiceProgressTotal}"
+                } else {
+                    "Voicing..."
+                }
+                Text(progressText, style = MaterialTheme.typography.bodySmall)
             } else {
                 Icon(Icons.Filled.RecordVoiceOver, contentDescription = null, modifier = Modifier.size(16.dp))
                 Spacer(Modifier.size(6.dp))
@@ -303,6 +308,17 @@ private fun ShotsDirectorTab(
             Spacer(Modifier.size(4.dp))
             Text("Shot", style = MaterialTheme.typography.bodySmall)
         }
+    }
+
+    if (state.isSynthesizingAllVoices && state.voiceProgressTotal > 0) {
+        LinearProgressIndicator(
+            progress = {
+                (state.voiceProgressCurrent.toFloat() / state.voiceProgressTotal.toFloat()).coerceIn(0f, 1f)
+            },
+            modifier = Modifier.fillMaxWidth().height(4.dp).testTag("director_voice_progress"),
+            color = InkBlack,
+            trackColor = HairlineBorder
+        )
     }
 
     OutlinedButton(
@@ -322,39 +338,81 @@ private fun ShotsDirectorTab(
     Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
         state.project.shots.forEachIndexed { idx, shot ->
             val isSelected = shot.shotId == state.selectedShotId
+            val voiceErr = state.failedVoiceShotIds[shot.shotId]
             Card(
                 modifier = Modifier
                     .fillMaxWidth()
                     .clickable { onSelectShot(shot.shotId) }
                     .testTag("shot_card_$idx"),
                 colors = CardDefaults.cardColors(
-                    containerColor = if (isSelected) InkBlack else StudioPaper
+                    containerColor = when {
+                        isSelected -> InkBlack
+                        voiceErr != null -> StudioCrimsonSoft
+                        else -> StudioPaper
+                    }
                 ),
-                border = BorderStroke(1.dp, if (isSelected) InkBlack else HairlineBorder)
+                border = BorderStroke(
+                    1.dp,
+                    when {
+                        isSelected -> InkBlack
+                        voiceErr != null -> StudioCrimson
+                        else -> HairlineBorder
+                    }
+                )
             ) {
-                Row(
-                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Column(modifier = Modifier.weight(1f)) {
+                Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "#${idx + 1} ${shot.speaker.label} • ${shot.framing.label}",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = if (isSelected) StudioWhite else InkBlack
+                            )
+                            Text(
+                                text = shot.transitionCard.ifBlank { shot.dialogue.ifBlank { "(Silent beat)" } },
+                                style = MaterialTheme.typography.bodySmall,
+                                color = if (isSelected) StudioSurfaceMuted else SlateMuted,
+                                maxLines = 1
+                            )
+                        }
                         Text(
-                            text = "#${idx + 1} ${shot.speaker.label} • ${shot.framing.label}",
+                            text = String.format(Locale.US, "%.1fs", shot.durationMs / 1000f),
                             style = MaterialTheme.typography.labelMedium,
-                            color = if (isSelected) StudioWhite else InkBlack
-                        )
-                        Text(
-                            text = shot.transitionCard.ifBlank { shot.dialogue.ifBlank { "(Silent beat)" } },
-                            style = MaterialTheme.typography.bodySmall,
-                            color = if (isSelected) StudioSurfaceMuted else SlateMuted,
-                            maxLines = 1
+                            color = if (isSelected) StudioWhite else SlateMuted
                         )
                     }
-                    Text(
-                        text = String.format(Locale.US, "%.1fs", shot.durationMs / 1000f),
-                        style = MaterialTheme.typography.labelMedium,
-                        color = if (isSelected) StudioWhite else SlateMuted
-                    )
+                    if (voiceErr != null) {
+                        Spacer(Modifier.height(6.dp))
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = voiceErr,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = if (isSelected) StudioSurfaceMuted else StudioCrimson,
+                                maxLines = 2,
+                                modifier = Modifier.weight(1f)
+                            )
+                            Spacer(Modifier.size(8.dp))
+                            OutlinedButton(
+                                onClick = { onRevoiceShot(shot.shotId) },
+                                enabled = !state.voicingShotIds.contains(shot.shotId),
+                                modifier = Modifier.height(48.dp).testTag("retry_voice_shot_$idx")
+                            ) {
+                                Text(
+                                    text = "Retry",
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = if (isSelected) StudioWhite else StudioCrimson
+                                )
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -700,6 +758,36 @@ private fun ShotsDirectorTab(
             }
         }
 
+        val activeVoiceError = state.failedVoiceShotIds[activeShot.shotId]
+        if (activeVoiceError != null) {
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = StudioCrimsonSoft),
+                border = BorderStroke(1.dp, StudioCrimson)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(10.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = activeVoiceError,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = StudioCrimson,
+                        modifier = Modifier.weight(1f)
+                    )
+                    Spacer(Modifier.size(8.dp))
+                    OutlinedButton(
+                        onClick = { onRevoiceShot(activeShot.shotId) },
+                        enabled = !isVoicingThis,
+                        modifier = Modifier.height(48.dp).testTag("retry_active_voice_button")
+                    ) {
+                        Text("Retry", color = StudioCrimson)
+                    }
+                }
+            }
+        }
+
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -713,7 +801,7 @@ private fun ShotsDirectorTab(
                 if (isVoicingThis) {
                     CircularProgressIndicator(modifier = Modifier.size(16.dp), color = StudioWhite, strokeWidth = 2.dp)
                 } else {
-                    Text("Voice Shot", style = MaterialTheme.typography.bodySmall)
+                    Text(if (activeVoiceError != null) "Retry Voice" else "Voice Shot", style = MaterialTheme.typography.bodySmall)
                 }
             }
 

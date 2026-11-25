@@ -23,11 +23,13 @@ import com.example.model.CaptionFontStyle
 import com.example.model.CaptionPosition
 import com.example.model.CaptionStyle
 import com.example.model.CastPreset
+import com.example.model.CharacterActivity
 import com.example.model.CharacterGender
 import com.example.model.CharacterProfile
 import com.example.model.ClonedStyleBlueprint
 import com.example.model.ComicSfx
 import com.example.model.ExportResolution
+import com.example.model.MoodPose
 import com.example.model.NichePreset
 import com.example.model.ReelColorTheme
 import com.example.model.ReelLanguage
@@ -36,6 +38,7 @@ import com.example.model.ReelShot
 import com.example.model.ReelStarterTemplate
 import com.example.model.RoomSetting
 import com.example.model.SampleScripts
+import com.example.model.ShotTransition
 import com.example.model.SocialMetaSuggestion
 import com.example.model.SpeakerSlot
 import com.example.model.TwistStructure
@@ -105,6 +108,9 @@ data class InkReelStudioState(
     val isImportingBgm: Boolean = false,
     val isExportingComicStrip: Boolean = false,
     val voicingShotIds: Set<String> = emptySet(),
+    val voiceProgressCurrent: Int = 0,
+    val voiceProgressTotal: Int = 0,
+    val failedVoiceShotIds: Map<String, String> = emptyMap(),
     val isAnalyzingStyle: Boolean = false,
     val clonedStyleBlueprint: ClonedStyleBlueprint? = null,
     val recordingShotId: String? = null,
@@ -583,7 +589,7 @@ class InkReelViewModel(
                             _playheadMs.value = 0L
                             savedStateHandle[KEY_PLAYHEAD_MS] = 0L
                             _uiState.update { it.copy(isPlaying = false) }
-                            livePlayer.stop()
+                            livePlayer.stop(flushImmediate = false)
                             break
                         } else {
                             _playheadMs.value = elapsedMs
@@ -1079,15 +1085,30 @@ class InkReelViewModel(
                 it.speaker != SpeakerSlot.SILENT && it.dialogue.isNotBlank()
             }
             if (spokenShots.isEmpty()) {
-                _uiState.update { it.copy(isSynthesizingAllVoices = false) }
+                _uiState.update {
+                    it.copy(
+                        isSynthesizingAllVoices = false,
+                        voiceProgressCurrent = 0,
+                        voiceProgressTotal = 0
+                    )
+                }
                 return@launch
             }
 
             deviceTts.clearCooldown()
-            _uiState.update { it.copy(isSynthesizingAllVoices = true, errorBanner = null) }
+            _uiState.update {
+                it.copy(
+                    isSynthesizingAllVoices = true,
+                    voiceProgressCurrent = 0,
+                    voiceProgressTotal = spokenShots.size,
+                    failedVoiceShotIds = emptyMap(),
+                    errorBanner = null
+                )
+            }
             val geminiCount = AtomicInteger(0)
             val deviceCount = AtomicInteger(0)
             val synthCount = AtomicInteger(0)
+            val completedCount = AtomicInteger(0)
             val geminiAllowed = AtomicBoolean(key.isNotBlank())
             val limiter = Semaphore(permits = 2)
 
@@ -1108,6 +1129,10 @@ class InkReelViewModel(
                                     VoiceSourceResult.CARTOON_SYNTH -> synthCount.incrementAndGet()
                                     VoiceSourceResult.FAILED -> Unit
                                 }
+                                val done = completedCount.incrementAndGet()
+                                _uiState.update { st ->
+                                    st.copy(voiceProgressCurrent = done.coerceAtMost(spokenShots.size))
+                                }
                             }
                         }
                     }.awaitAll()
@@ -1117,10 +1142,15 @@ class InkReelViewModel(
                 val dCount = deviceCount.get()
                 val cCount = synthCount.get()
                 val totalVoiced = gCount + dCount + cCount
+                val failedMap = _uiState.value.failedVoiceShotIds
                 updateStudioState {
                     it.copy(
                         hasGeneratedReel = true,
-                        errorBanner = null,
+                        errorBanner = if (key.isNotBlank() && failedMap.isNotEmpty()) {
+                            "${failedMap.size} line(s) used local backup voice (${failedMap.values.first()}). Tap Retry on highlighted lines."
+                        } else {
+                            null
+                        },
                         statusBanner = when {
                             gCount > 0 && dCount == 0 && cCount == 0 ->
                                 "Voiced all $gCount shots with Gemini AI Voice! Tap Play or Download MP4."
@@ -1149,7 +1179,8 @@ class InkReelViewModel(
                 val outcome = synthesizeShotWithFallback(
                     apiKey = key,
                     shotId = shotId,
-                    geminiTtsAllowed = AtomicBoolean(key.isNotBlank())
+                    geminiTtsAllowed = AtomicBoolean(key.isNotBlank()),
+                    forceRetryGemini = key.isNotBlank()
                 )
                 if (outcome != VoiceSourceResult.FAILED) {
                     val label = when (outcome) {
@@ -1158,11 +1189,16 @@ class InkReelViewModel(
                         VoiceSourceResult.CARTOON_SYNTH -> "Expressive Cartoon Synth"
                         VoiceSourceResult.FAILED -> ""
                     }
+                    val remainingFailure = _uiState.value.failedVoiceShotIds[shotId]
                     updateStudioState {
                         it.copy(
                             lastMp4Export = null,
-                            errorBanner = null,
-                            statusBanner = "Shot voiced ($label) & lip-synced."
+                            errorBanner = remainingFailure,
+                            statusBanner = if (remainingFailure == null) {
+                                "Shot voiced ($label) & lip-synced."
+                            } else {
+                                "Backup voice applied ($label)."
+                            }
                         )
                     }
                 } else {
@@ -1187,7 +1223,14 @@ class InkReelViewModel(
             return
         }
 
-        _uiState.update { it.copy(isSynthesizingAllVoices = true) }
+        _uiState.update {
+            it.copy(
+                isSynthesizingAllVoices = true,
+                voiceProgressCurrent = 0,
+                voiceProgressTotal = missing.size
+            )
+        }
+        val completedCount = AtomicInteger(0)
         val geminiAllowed = AtomicBoolean(key.isNotBlank())
         val limiter = Semaphore(permits = 2)
         try {
@@ -1200,6 +1243,10 @@ class InkReelViewModel(
                                 shotId = shot.shotId,
                                 geminiTtsAllowed = geminiAllowed
                             )
+                            val done = completedCount.incrementAndGet()
+                            _uiState.update { st ->
+                                st.copy(voiceProgressCurrent = done.coerceAtMost(missing.size))
+                            }
                         }
                     }
                 }.awaitAll()
@@ -1211,28 +1258,21 @@ class InkReelViewModel(
 
     private enum class VoiceSourceResult { GEMINI, DEVICE, CARTOON_SYNTH, FAILED }
 
-    private fun isFatalGeminiTtsError(message: String?): Boolean {
+    private fun isNonRecoverableAuthOrOfflineError(message: String?): Boolean {
         val msg = message.orEmpty()
-        return msg.contains("no longer available", ignoreCase = true) ||
-            msg.contains("not found", ignoreCase = true) ||
-            msg.contains("No internet connection", ignoreCase = true) ||
-            msg.contains("HTTP 404", ignoreCase = true) ||
-            msg.contains("HTTP 403", ignoreCase = true) ||
-            msg.contains("HTTP 401", ignoreCase = true) ||
+        return msg.contains("No internet connection", ignoreCase = true) ||
             msg.contains("HTTP 400", ignoreCase = true) ||
-            msg.contains("HTTP 429", ignoreCase = true) ||
-            msg.contains("HTTP 503", ignoreCase = true) ||
-            msg.contains("high demand", ignoreCase = true) ||
+            msg.contains("HTTP 401", ignoreCase = true) ||
+            msg.contains("HTTP 403", ignoreCase = true) ||
             msg.contains("API key", ignoreCase = true) ||
-            msg.contains("quota", ignoreCase = true) ||
-            msg.contains("rate limit", ignoreCase = true) ||
             msg.contains("PERMISSION_DENIED", ignoreCase = true)
     }
 
     private suspend fun synthesizeShotWithFallback(
         apiKey: String,
         shotId: String,
-        geminiTtsAllowed: AtomicBoolean
+        geminiTtsAllowed: AtomicBoolean,
+        forceRetryGemini: Boolean = false
     ): VoiceSourceResult {
         val current = _uiState.value.project
         val shot = current.shots.firstOrNull { it.shotId == shotId } ?: return VoiceSourceResult.FAILED
@@ -1245,52 +1285,92 @@ class InkReelViewModel(
 
         _uiState.update { it.copy(voicingShotIds = it.voicingShotIds + shotId) }
 
+        val fullInputText = shot.phoneticHint.ifBlank { shot.dialogue }
+        val chunks = geminiService.splitTextIntoTtsChunks(fullInputText, maxChunkChars = 250)
+            .ifEmpty { listOf(shot.dialogue.trim()) }
+        val chunkPcms = mutableListOf<ByteArray>()
+        var geminiChunks = 0
+        var deviceChunks = 0
+        var synthChunks = 0
+        var geminiFailureReason: String? = null
+
         var resultSource = VoiceSourceResult.FAILED
         try {
-            if (apiKey.isNotBlank() && geminiTtsAllowed.get()) {
-                val geminiRes = geminiService.synthesizeShotVoice(
-                    apiKey = apiKey,
-                    dialogue = shot.phoneticHint.ifBlank { shot.dialogue },
-                    voiceName = voiceName,
-                    moodPose = shot.moodPose
-                )
-                geminiRes.onSuccess { synth ->
-                    applyShotPcm(shotId, synth.pcmBytes, synth.rawDurationMs, speed, "Gemini TTS ($voiceName)")
-                    resultSource = VoiceSourceResult.GEMINI
-                }.onFailure { err ->
-                    if (isFatalGeminiTtsError(err.localizedMessage)) {
-                        geminiTtsAllowed.set(false)
-                    }
-                }
-            }
+            for (chunk in chunks) {
+                var chunkPcm: ByteArray? = null
 
-            if (resultSource == VoiceSourceResult.FAILED) {
-                val deviceRes = deviceTts.synthesizeShotVoice(
-                    dialogue = shot.dialogue,
-                    phoneticHint = shot.phoneticHint,
-                    gender = gender,
-                    language = current.language,
-                    moodPose = shot.moodPose
-                )
-                deviceRes.onSuccess { synth ->
-                    val tag = if (gender == CharacterGender.FEMALE) "Device Voice (Girl)" else "Device Voice (Boy)"
-                    applyShotPcm(shotId, synth.pcmBytes, synth.rawDurationMs, speed, tag)
-                    resultSource = VoiceSourceResult.DEVICE
-                }
-            }
-
-            // 3rd-tier guaranteed local cartoon voice synth on Dispatchers.Default
-            if (resultSource == VoiceSourceResult.FAILED) {
-                val fallbackSynth = withContext(Dispatchers.Default) {
-                    ProceduralAudioEngine.synthesizeCartoonVoiceFallback(
-                        text = shot.dialogue,
-                        gender = gender,
+                if (apiKey.isNotBlank() && (geminiTtsAllowed.get() || forceRetryGemini)) {
+                    val geminiRes = geminiService.synthesizeSpeechChunkGemini(
+                        apiKey = apiKey,
+                        chunkText = chunk,
+                        voiceName = voiceName,
                         moodPose = shot.moodPose
                     )
+                    geminiRes.onSuccess { synth ->
+                        chunkPcm = synth.pcmBytes
+                        geminiChunks++
+                    }.onFailure { err ->
+                        val reason = err.localizedMessage ?: "Gemini TTS unavailable"
+                        geminiFailureReason = reason
+                        if (isNonRecoverableAuthOrOfflineError(reason)) {
+                            geminiTtsAllowed.set(false)
+                        }
+                    }
                 }
-                val tag = if (gender == CharacterGender.FEMALE) "Cartoon Synth (Girl)" else "Cartoon Synth (Boy)"
-                applyShotPcm(shotId, fallbackSynth.pcmBytes, fallbackSynth.rawDurationMs, speed, tag)
-                resultSource = VoiceSourceResult.CARTOON_SYNTH
+
+                if (chunkPcm == null) {
+                    val deviceRes = deviceTts.synthesizeShotVoice(
+                        dialogue = chunk,
+                        phoneticHint = if (shot.phoneticHint.isNotBlank() && chunks.size == 1) shot.phoneticHint else "",
+                        gender = gender,
+                        language = current.language,
+                        moodPose = shot.moodPose
+                    )
+                    deviceRes.onSuccess { synth ->
+                        chunkPcm = synth.pcmBytes
+                        deviceChunks++
+                    }
+                }
+
+                if (chunkPcm == null) {
+                    val fallbackSynth = withContext(Dispatchers.Default) {
+                        ProceduralAudioEngine.synthesizeCartoonVoiceFallback(
+                            text = chunk,
+                            gender = gender,
+                            moodPose = shot.moodPose
+                        )
+                    }
+                    chunkPcm = fallbackSynth.pcmBytes
+                    synthChunks++
+                }
+
+                chunkPcms.add(chunkPcm)
+            }
+
+            val combinedPcm = ProceduralAudioEngine.concatenatePcm24kMono(chunkPcms, gapMs = 200L)
+            if (combinedPcm.size >= 2) {
+                val combinedDurationMs = ((combinedPcm.size.toDouble() / 48000.0) * 1000.0).toLong().coerceAtLeast(700L)
+                val label = when {
+                    geminiChunks == chunks.size -> "Gemini TTS ($voiceName)"
+                    geminiChunks > 0 -> "Gemini + Local ($voiceName)"
+                    deviceChunks > 0 -> if (gender == CharacterGender.FEMALE) "Device Voice (Girl)" else "Device Voice (Boy)"
+                    else -> if (gender == CharacterGender.FEMALE) "Cartoon Synth (Girl)" else "Cartoon Synth (Boy)"
+                }
+                applyShotPcm(shotId, combinedPcm, combinedDurationMs, speed, label)
+                resultSource = when {
+                    geminiChunks > 0 && deviceChunks == 0 && synthChunks == 0 -> VoiceSourceResult.GEMINI
+                    deviceChunks > 0 -> VoiceSourceResult.DEVICE
+                    else -> VoiceSourceResult.CARTOON_SYNTH
+                }
+            }
+
+            _uiState.update { st ->
+                val updatedFailures = if (apiKey.isNotBlank() && geminiFailureReason != null) {
+                    st.failedVoiceShotIds + (shotId to geminiFailureReason)
+                } else {
+                    st.failedVoiceShotIds - shotId
+                }
+                st.copy(failedVoiceShotIds = updatedFailures)
             }
         } finally {
             _uiState.update { it.copy(voicingShotIds = it.voicingShotIds - shotId) }
@@ -1317,8 +1397,8 @@ class InkReelViewModel(
             repository.saveShotAudioPcm(projKey, shotId, pcmBytes)
         }
 
-        // Allow up to 30 seconds per shot so long lines never get cut off mid-sentence
-        val adjustedMs = ((rawDurationMs / speed).toLong() + 350L).coerceIn(1100L, 30000L)
+        // Exact duration from real synthesized audio + brief breathing margin (never truncated at 30s)
+        val adjustedMs = ((rawDurationMs / speed).toLong() + 220L).coerceAtLeast(1100L)
         updateStudioState { st ->
             val updatedShots = st.project.shots.map {
                 if (it.shotId == shotId) {
@@ -1440,9 +1520,43 @@ class InkReelViewModel(
             _uiState.update { it.copy(errorBanner = "Maximum ${ReelProject.MAX_SHOTS} shots per reel.") }
             return
         }
+        val prev = current.shots.lastOrNull()
+        val idx = current.shots.size
+        val nextSpeaker = when (prev?.speaker) {
+            SpeakerSlot.A -> SpeakerSlot.B
+            SpeakerSlot.B -> SpeakerSlot.A
+            else -> SpeakerSlot.B
+        }
+        val nextRoom = RoomSetting.entries.firstOrNull { it != (prev?.roomOverride ?: current.setting) } ?: current.setting
+        val framings = listOf(
+            CameraFraming.CLOSE_UP_A,
+            CameraFraming.CLOSE_UP_B,
+            CameraFraming.OVER_THE_SHOULDER,
+            CameraFraming.WIDE_DOORWAY,
+            CameraFraming.SITTING_AT_DESK,
+            CameraFraming.SPLIT_PHONE_CALL
+        )
+        val nextFraming = framings[idx % framings.size].let {
+            if (it == prev?.framing) framings[(idx + 1) % framings.size] else it
+        }
+        val nextActivity = CharacterActivity.entries[idx % CharacterActivity.entries.size].let {
+            if (it == prev?.activity) CharacterActivity.entries[(idx + 1) % CharacterActivity.entries.size] else it
+        }
+        val nextMood = MoodPose.entries[idx % MoodPose.entries.size].let {
+            if (it == prev?.moodPose) MoodPose.entries[(idx + 1) % MoodPose.entries.size] else it
+        }
+        val transitions = listOf(ShotTransition.WHIP_PAN, ShotTransition.ZOOM_PUNCH, ShotTransition.FLASH, ShotTransition.CUT)
+        val nextTransition = transitions[idx % transitions.size].let {
+            if (it == prev?.transition) transitions[(idx + 1) % transitions.size] else it
+        }
         val newShot = ReelShot(
             shotId = "shot_${UUID.randomUUID().toString().take(6)}",
-            speaker = SpeakerSlot.B,
+            speaker = nextSpeaker,
+            framing = nextFraming,
+            roomOverride = nextRoom,
+            transition = nextTransition,
+            activity = nextActivity,
+            moodPose = nextMood,
             dialogue = "Wait, seriously?!",
             speechBubble = "SERIOUSLY?!"
         )
@@ -1552,7 +1666,7 @@ class InkReelViewModel(
                         val pcm = shotAudioMap[s.shotId]
                         if (pcm != null) {
                             val rawMs = ((pcm.size.toDouble() / 48000.0) * 1000.0).toLong()
-                            val newDur = ((rawMs / profile.voiceSpeed).toLong() + 350L).coerceIn(1100L, 30000L)
+                            val newDur = ((rawMs / profile.voiceSpeed).toLong() + 220L).coerceAtLeast(1100L)
                             s.copy(durationMs = newDur)
                         } else s
                     } else s

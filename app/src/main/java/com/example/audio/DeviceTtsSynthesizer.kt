@@ -396,7 +396,8 @@ class DeviceTtsSynthesizer(
                 bitsPerSample = readShortLe(wav, bodyStart + 14).coerceAtLeast(8)
             } else if (chunkId == "data") {
                 dataOffset = bodyStart
-                dataSize = chunkLen.coerceAtMost(wav.size - bodyStart)
+                val remaining = (wav.size - bodyStart).coerceAtLeast(0)
+                dataSize = if (chunkLen > 0) chunkLen.coerceAtMost(remaining) else remaining
                 break
             }
             val next = bodyStart + chunkLen + (chunkLen and 1)
@@ -428,7 +429,7 @@ class DeviceTtsSynthesizer(
         }
 
         val targetRate = ProceduralAudioEngine.SAMPLE_RATE
-        val dstFrames = ((srcFrames.toLong() * targetRate) / srcRate).toInt().coerceAtLeast(1)
+        val dstFrames = kotlin.math.ceil((srcFrames.toDouble() * targetRate) / srcRate).toInt().coerceAtLeast(1)
         val out = ByteArray(dstFrames * 2)
         for (j in 0 until dstFrames) {
             val srcPos = (j.toDouble() * srcRate) / targetRate

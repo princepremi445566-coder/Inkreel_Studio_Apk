@@ -348,35 +348,47 @@ object StickmanRenderer {
         val baseZoom: Float
         val focusX: Float
         val focusY: Float
+        val dirSign = if ((shot.shotId.hashCode() and 1) == 0) 1f else -1f
         when (shot.framing) {
             CameraFraming.CLOSE_UP_A -> {
-                baseZoom = 1.72f
-                focusX = width * 0.30f
+                baseZoom = 1.76f - prog * 0.12f
+                focusX = width * (0.30f + prog * 0.02f)
                 focusY = height * 0.47f
             }
             CameraFraming.CLOSE_UP_B -> {
-                baseZoom = 1.72f
-                focusX = width * 0.70f
+                baseZoom = 1.76f - prog * 0.12f
+                focusX = width * (0.70f - prog * 0.02f)
                 focusY = height * 0.47f
             }
             CameraFraming.CLOSE_UP_C -> {
-                baseZoom = 1.72f
+                baseZoom = 1.66f + prog * 0.12f
                 focusX = width * 0.50f
-                focusY = height * 0.46f
+                focusY = height * (0.47f - prog * 0.015f)
             }
             CameraFraming.OVER_THE_SHOULDER -> {
-                baseZoom = 1.36f
-                focusX = if (shot.speaker == SpeakerSlot.A) width * 0.34f else width * 0.66f
+                baseZoom = 1.33f + prog * 0.09f
+                val baseFx = if (shot.speaker == SpeakerSlot.A) 0.34f else 0.66f
+                focusX = width * (baseFx + dirSign * (prog - 0.5f) * 0.03f)
                 focusY = height * 0.50f
             }
             CameraFraming.DESK_SLAM -> {
-                baseZoom = 1.22f
+                baseZoom = 1.24f + prog * 0.06f
                 focusX = width * 0.50f
                 focusY = height * 0.54f
             }
-            else -> {
-                baseZoom = 1.0f
+            CameraFraming.WIDE_DOORWAY -> {
+                baseZoom = 1.0f + prog * 0.08f
+                focusX = width * (0.48f + prog * 0.04f)
+                focusY = height * 0.50f
+            }
+            CameraFraming.SPLIT_PHONE_CALL -> {
+                baseZoom = 1.0f + sin(prog * PI.toFloat()) * 0.03f
                 focusX = width * 0.50f
+                focusY = height * 0.50f
+            }
+            else -> {
+                baseZoom = if (dirSign > 0f) (1.0f + prog * 0.08f) else (1.08f - prog * 0.07f)
+                focusX = width * (0.50f + dirSign * (prog - 0.5f) * 0.04f)
                 focusY = height * 0.50f
             }
         }
@@ -1604,6 +1616,23 @@ object StickmanRenderer {
     ) {
         val pulse = 1f + 0.08f * sin(prog * 24f)
         val uPulse = unit * pulse
+        val spinAngle = prog * 2.4f
+
+        p.angerPaint.color = colors.accentColor
+        p.angerPaint.strokeWidth = 5f * unit
+        for (i in 0 until 8) {
+            val angle = spinAngle + (i * (2f * PI.toFloat() / 8f))
+            val rIn = (108f + 10f * sin(prog * 18f + i)) * unit
+            val rOut = (158f + 16f * cos(prog * 14f + i)) * unit
+            canvas.drawLine(
+                cx + cos(angle) * rIn,
+                cy + sin(angle) * rIn,
+                cx + cos(angle) * rOut,
+                cy + sin(angle) * rOut,
+                p.angerPaint
+            )
+        }
+
         canvas.drawCircle(cx - 70f * uPulse, cy + 10f * uPulse, 58f * unit, p.whiteFill)
         canvas.drawCircle(cx + 70f * uPulse, cy + 16f * uPulse, 62f * unit, p.whiteFill)
         canvas.drawCircle(cx - 25f * uPulse, cy - 45f * uPulse, 64f * unit, p.whiteFill)
@@ -1616,6 +1645,13 @@ object StickmanRenderer {
         canvas.drawCircle(cx - 25f * uPulse, cy - 45f * uPulse, 64f * unit, p.inkPaint)
         canvas.drawCircle(cx + 35f * uPulse, cy - 38f * uPulse, 60f * unit, p.inkPaint)
         canvas.drawCircle(cx, cy + 20f * uPulse, 72f * unit, p.inkPaint)
+
+        for (i in 0 until 4) {
+            val orbitAngle = spinAngle * 1.4f + i * (PI.toFloat() / 2f)
+            val sx = cx + cos(orbitAngle) * 116f * uPulse
+            val sy = cy - 18f * unit + sin(orbitAngle) * 74f * uPulse
+            canvas.drawCircle(sx, sy, 8f * unit, p.goldFill)
+        }
 
         p.textPaint.color = colors.accentColor
         p.textPaint.typeface = boldDefaultTf

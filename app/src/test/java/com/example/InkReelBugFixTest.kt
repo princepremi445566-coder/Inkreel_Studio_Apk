@@ -7,13 +7,17 @@ import android.os.Looper
 import androidx.lifecycle.SavedStateHandle
 import androidx.test.core.app.ApplicationProvider
 import org.robolectric.Shadows
+import com.example.ai.ComedyScriptGenerator
+import com.example.ai.GeminiHttpException
 import com.example.ai.GeminiInkReelService
+import com.example.ai.GeminiModels
 import com.example.audio.DeviceTtsSynthesizer
 import com.example.audio.HinglishPhoneticTuner
 import com.example.audio.ProceduralAudioEngine
 import com.example.canvas.StickmanRenderer
 import com.example.data.ReelRepository
 import com.example.export.ComicStripExporter
+import com.example.export.Mp4Exporter
 import com.example.model.AmbientBed
 import com.example.model.CameraFraming
 import com.example.model.CastPreset
@@ -889,5 +893,423 @@ class InkReelBugFixTest {
 
         repo.deleteCastPreset(savedPreset.id)
         assertFalse(repo.castPresets.value.any { it.id == savedPreset.id })
+    }
+
+    @Test
+    fun bug1_geminiModelsDiscoverySkipsRetiredModelsAndFormatsFriendlyErrors() {
+        GeminiModels.clearCachedModels()
+        try {
+            assertEquals("gemini-3.5-flash-lite", GeminiModels.PRIMARY_TEXT_MODEL)
+            assertEquals("gemini-3.5-flash-lite", GeminiModels.PRIMARY_VISION_MODEL)
+            assertEquals("gemini-3.8-flash-tts", GeminiModels.PRIMARY_TTS_MODEL)
+
+            val modelsArray = org.json.JSONArray().apply {
+                put(org.json.JSONObject().apply {
+                    put("name", "models/gemini-2.5-flash-lite")
+                    put("supportedGenerationMethods", org.json.JSONArray(listOf("generateContent")))
+                })
+                put(org.json.JSONObject().apply {
+                    put("name", "models/gemini-2.5-flash")
+                    put("supportedGenerationMethods", org.json.JSONArray(listOf("generateContent")))
+                })
+                put(org.json.JSONObject().apply {
+                    put("name", "models/gemini-3.5-flash")
+                    put("supportedGenerationMethods", org.json.JSONArray(listOf("generateContent")))
+                })
+                put(org.json.JSONObject().apply {
+                    put("name", "models/gemini-3.5-flash-lite")
+                    put("supportedGenerationMethods", org.json.JSONArray(listOf("generateContent")))
+                })
+                put(org.json.JSONObject().apply {
+                    put("name", "models/gemini-3.8-flash-tts")
+                    put("supportedGenerationMethods", org.json.JSONArray(listOf("generateContent")))
+                })
+                put(org.json.JSONObject().apply {
+                    put("name", "models/text-embedding-004")
+                    put("supportedGenerationMethods", org.json.JSONArray(listOf("embedContent")))
+                })
+            }
+            val listJson = org.json.JSONObject().put("models", modelsArray)
+
+            assertEquals(
+                "gemini-3.5-flash-lite",
+                GeminiModels.pickBestModelFromListModels(listJson, GeminiModels.ModelKind.TEXT)
+            )
+            assertEquals(
+                "gemini-3.5-flash-lite",
+                GeminiModels.pickBestModelFromListModels(listJson, GeminiModels.ModelKind.VISION)
+            )
+            assertEquals(
+                "gemini-3.8-flash-tts",
+                GeminiModels.pickBestModelFromListModels(listJson, GeminiModels.ModelKind.TTS)
+            )
+
+            // Retired model is never selected even when newer text models are excluded
+            val fallbackText = GeminiModels.pickBestModelFromListModels(
+                listModelsJson = listJson,
+                kind = GeminiModels.ModelKind.TEXT,
+                excludeModels = setOf("gemini-3.5-flash-lite", "gemini-3.5-flash")
+            )
+            assertEquals("gemini-2.5-flash", fallbackText)
+
+            // Cached model becomes top priority
+            GeminiModels.cacheModel(GeminiModels.ModelKind.TEXT, "gemini-3.5-flash")
+            assertEquals("gemini-3.5-flash", GeminiModels.candidatesFor(GeminiModels.ModelKind.TEXT).first())
+
+            // Friendly error mapping strips raw HTTP / JSON details
+            val service = GeminiInkReelService()
+            val friendly404 = service.toUserFriendlyException(
+                GeminiHttpException(404, "{\"error\":{\"code\":404,\"message\":\"models/gemini-2.5-flash-lite is no longer available\"}}")
+            )
+            assertFalse(friendly404.message!!.contains("{\"error\""))
+            assertTrue(friendly404.message!!.contains("404") || friendly404.message!!.contains("unavailable", ignoreCase = true))
+
+            val friendly429 = service.toUserFriendlyException(
+                GeminiHttpException(429, "Quota exceeded details...")
+            )
+            assertFalse(friendly429.message!!.contains("details..."))
+            assertTrue(friendly429.message!!.contains("429"))
+        } finally {
+            GeminiModels.clearCachedModels()
+        }
+    }
+
+    @Test
+    fun bug2_ttsChunkingAndPcmConcatenationAndUnrestrictedDurationWork() {
+        val service = GeminiInkReelService()
+        val longDialogue = buildString {
+            append("Line one: Arre yaar yeh meeting kab khatam hogi, mera chai thanda ho raha hai! ")
+            append("Line two: Boss bol rahe hain ek aur quick alignment call chahiye lunch ke baad, ")
+            append("aur phir client ko pitch deck bhejna hai shaam ko paanch baje se pehle bilkul ready karke! ")
+            append("Line three: Chalo koi baat nahi, coffee peete hain aur phir turbo speed mein sab finish kar dete hain.\n")
+            append("Second paragraph line: Phir weekend pe full aaram karenge bina kisi laptop ke!")
+        }
+        val chunks = service.splitTextIntoTtsChunks(longDialogue, maxChunkChars = 250)
+        assertTrue("Long dialogue should split into >= 3 chunks", chunks.size >= 3)
+        assertTrue("Every chunk must be <= 250 chars", chunks.all { it.length in 1..250 })
+        assertTrue("Order must preserve final line at end", chunks.last().contains("weekend"))
+
+        // Concatenate 3 non-zero 24kHz PCM chunks with 200ms gap
+        val chunkA = ByteArray(4800 * 2) { if (it % 2 == 0) 0x20 else 0x05 }
+        val chunkB = ByteArray(2400 * 2) { if (it % 2 == 0) 0x40 else 0x0A }
+        val chunkC = ByteArray(3600 * 2) { if (it % 2 == 0) 0x60 else 0x0F }
+        val gapBytes = ((ProceduralAudioEngine.SAMPLE_RATE * 200L) / 1000L).toInt() * 2
+        val joined = ProceduralAudioEngine.concatenatePcm24kMono(listOf(chunkA, chunkB, chunkC), gapMs = 200L)
+
+        assertEquals(chunkA.size + gapBytes + chunkB.size + gapBytes + chunkC.size, joined.size)
+        // Verify start, silence gap, middle, and final tail bytes are exact
+        assertEquals(chunkA[0], joined[0])
+        assertEquals(0.toByte(), joined[chunkA.size])
+        assertEquals(0.toByte(), joined[chunkA.size + gapBytes - 1])
+        assertEquals(chunkB[0], joined[chunkA.size + gapBytes])
+        assertEquals(chunkC.last(), joined.last())
+
+        // Long project (> 30s single shot) is not capped at 30s
+        val longProject = ReelProject(
+            enableOutro = true,
+            outroText = "FOLLOW FOR PART 2!",
+            shots = listOf(
+                ReelShot(shotId = "long_1", dialogue = "Long monologue", durationMs = 45_000L),
+                ReelShot(shotId = "long_2", dialogue = "Final punchline", durationMs = 18_000L)
+            )
+        )
+        assertEquals(2000L, longProject.outroDurationMs)
+        assertEquals(65_000L, longProject.totalDurationMs)
+        val restored = ReelProject.fromJson(longProject.toJson())
+        assertEquals(45_000L, restored.shots[0].durationMs)
+        assertEquals(65_000L, restored.totalDurationMs)
+    }
+
+    @Test
+    fun bug3_eightLineHinglishScriptProducesEightDistinctAnimatedScenesAndOutroFinal2s() {
+        val service = GeminiInkReelService()
+        val script8 = """
+            Amit: Yaar aaj gym jaana hi padega, warna pet bahar aa raha hai!
+            Priya: [Room: KITCHEN] [Framing: DESK_SLAM] [Mood: SHOCKED] [Activity: DANCING] [Transition: ZOOM_PUNCH] Pehle yeh samosa toh chhod de!
+            Amit: Samosa warm-up tha bro, ab real workout shuru hoga.
+            Priya: Kal bhi yahi bola tha aur sofa pe so gaya tha.
+            Rohan: Wait guys, main protein shake leke aaya hoon... chocolate flavour!
+            Amit: Arre waah, phir toh aaj leg day cancel aur cheat day confirm!
+            Priya: Tum dono kabhi nahi sudhroge, main akeli ja rahi hoon!
+            Rohan: Ruk ja Priya, hum bhi auto se aa rahe hain gym ke gate tak!
+        """.trimIndent()
+
+        val parsed = service.parseScriptLocally(
+            scriptText = script8,
+            settingHint = null,
+            language = "Hinglish",
+            baseProject = ReelProject(
+                enableOutro = true,
+                outroText = "FOLLOW FOR PART 2!"
+            )
+        )
+        assertEquals(8, parsed.shots.size)
+        assertEquals(2000L, parsed.outroDurationMs)
+
+        // Manual overrides on shot 2 must be preserved
+        val shot2 = parsed.shots[1]
+        assertEquals(RoomSetting.KITCHEN, shot2.roomOverride)
+        assertEquals(CameraFraming.DESK_SLAM, shot2.framing)
+        assertEquals(MoodPose.SHOCKED, shot2.moodPose)
+        assertEquals(CharacterActivity.DANCING, shot2.activity)
+        assertEquals(ShotTransition.ZOOM_PUNCH, shot2.transition)
+
+        // Every consecutive scene pair must differ in room, framing, activity, or mood
+        for (i in 1 until parsed.shots.size) {
+            val prev = parsed.shots[i - 1]
+            val curr = parsed.shots[i]
+            val prevRoom = prev.roomOverride ?: parsed.setting
+            val currRoom = curr.roomOverride ?: parsed.setting
+            val sameCombo = prevRoom == currRoom &&
+                prev.framing == curr.framing &&
+                prev.activity == curr.activity &&
+                prev.moodPose == curr.moodPose
+            assertFalse("Consecutive scenes ${i - 1} and $i should not repeat identical combo", sameCombo)
+        }
+
+        // Timeline resolution advances through all 8 scenes and enters outro ONLY in final 2000ms
+        var acc = 0L
+        for (i in parsed.shots.indices) {
+            val mid = acc + parsed.shots[i].durationMs / 2L
+            val resolved = StickmanRenderer.resolveShotAt(parsed, mid)
+            assertEquals("Playhead $mid ms should resolve to shot $i", i, resolved.shotIndex)
+            assertFalse("Playhead $mid ms should not be outro yet", resolved.isOutro)
+            acc += parsed.shots[i].durationMs
+        }
+        val beforeOutro = StickmanRenderer.resolveShotAt(parsed, acc - 100L)
+        assertEquals(7, beforeOutro.shotIndex)
+        assertFalse(beforeOutro.isOutro)
+        val insideOutro = StickmanRenderer.resolveShotAt(parsed, acc + 500L)
+        assertTrue(insideOutro.isOutro)
+
+        // Verify final scene keeps animating across timestamps (camera transforms & limb/lip draw coords change)
+        val lastStart = acc - parsed.shots.last().durationMs
+        val lastEarly = StickmanRenderer.resolveShotAt(parsed, lastStart + 150L)
+        val lastLate = StickmanRenderer.resolveShotAt(parsed, acc - 150L)
+        assertEquals(7, lastEarly.shotIndex)
+        assertEquals(7, lastLate.shotIndex)
+        assertTrue("Last scene progress must advance (${lastEarly.progress} -> ${lastLate.progress})", lastLate.progress > lastEarly.progress + 0.5f)
+
+        class TraceCanvas : Canvas(Bitmap.createBitmap(180, 320, Bitmap.Config.ARGB_8888)) {
+            val trace = StringBuilder()
+            override fun scale(sx: Float, sy: Float) {
+                trace.append("S(%.3f,%.3f);".format(sx, sy))
+                super.scale(sx, sy)
+            }
+            override fun translate(dx: Float, dy: Float) {
+                trace.append("T(%.2f,%.2f);".format(dx, dy))
+                super.translate(dx, dy)
+            }
+            override fun drawLine(startX: Float, startY: Float, stopX: Float, stopY: Float, paint: android.graphics.Paint) {
+                trace.append("L(%.1f,%.1f->%.1f,%.1f);".format(startX, startY, stopX, stopY))
+                super.drawLine(startX, startY, stopX, stopY, paint)
+            }
+            override fun drawCircle(cx: Float, cy: Float, radius: Float, paint: android.graphics.Paint) {
+                trace.append("C(%.1f,%.1f,%.1f);".format(cx, cy, radius))
+                super.drawCircle(cx, cy, radius, paint)
+            }
+        }
+        val canvasA = TraceCanvas()
+        val canvasB = TraceCanvas()
+        StickmanRenderer.renderFrame(
+            canvas = canvasA,
+            width = 180f,
+            height = 320f,
+            project = parsed,
+            playheadMs = lastStart + 150L,
+            lipAmplitude = 0.2f,
+            showCaptions = true,
+            showSpeechBubbles = true
+        )
+        StickmanRenderer.renderFrame(
+            canvas = canvasB,
+            width = 180f,
+            height = 320f,
+            project = parsed,
+            playheadMs = acc - 150L,
+            lipAmplitude = 0.8f,
+            showCaptions = true,
+            showSpeechBubbles = true
+        )
+        assertTrue("Canvas trace must record camera/character draw ops", canvasA.trace.isNotEmpty())
+        assertTrue("Last scene draw trace must animate across timestamps", canvasA.trace.toString() != canvasB.trace.toString())
+
+        // Lip-sync envelope stays active on last spoken scene and 0 during final 2s outro
+        val voicePcm = ByteArray(24000 * 6 * 2) { idx ->
+            if (idx % 2 == 0) 0x30 else 0x18
+        }
+        val audioMap = parsed.shots.associate { it.shotId to voicePcm }
+        val totalFrames = kotlin.math.ceil((parsed.totalDurationMs * 30.0) / 1000.0).toInt()
+        val env = Mp4Exporter.buildTimelineLipEnvelope(parsed, audioMap, totalFrames)
+        val lastSceneMidFrame = (((lastStart + parsed.shots.last().durationMs / 2L) * 30L) / 1000L).toInt()
+        val outroMidFrame = (((acc + 1000L) * 30L) / 1000L).toInt()
+        assertTrue("Last spoken scene should have active lip amplitude", env[lastSceneMidFrame] > 0.05f)
+        assertEquals(0f, env[outroMidFrame], 0.001f)
+    }
+
+    @Test
+    fun comedyScriptGenerator_promptBannedTopicsAndLinesJsonWork() {
+        ComedyScriptGenerator.clearHistory()
+        try {
+            assertEquals(24, ComedyScriptGenerator.TOPIC_POOL.size)
+            assertEquals(14, ComedyScriptGenerator.CONFLICT_POOL.size)
+            assertEquals(20, ComedyScriptGenerator.ACTION_STYLES.size)
+
+            // Record 12 jokes -> rolling banned_topics keeps only the last 10
+            for (i in 0 until 12) {
+                val topic = ComedyScriptGenerator.TOPIC_POOL[i]
+                ComedyScriptGenerator.recordGenerated(topic, "Title $i", "Punchline $i")
+            }
+            val summaries = ComedyScriptGenerator.getBannedSummaries()
+            assertEquals(10, summaries.size)
+            assertFalse("Oldest topic Chai tapri should have rolled out", "chai tapri" in ComedyScriptGenerator.getBannedTopics())
+            assertTrue("Recent topic should be banned", "salon" in ComedyScriptGenerator.getBannedTopics())
+
+            val base = ReelProject(
+                characters = listOf(
+                    CharacterProfile(slot = SpeakerSlot.A, name = "Aarav", gender = CharacterGender.MALE),
+                    CharacterProfile(slot = SpeakerSlot.B, name = "Priya", gender = CharacterGender.FEMALE)
+                )
+            )
+            val bundle = ComedyScriptGenerator.buildPromptBundle(
+                niche = "",
+                twist = "",
+                language = "Hinglish",
+                hook = "",
+                clonedBlueprint = null,
+                baseProject = base
+            )
+            assertFalse("Random topic must avoid currently banned topics", bundle.topic.lowercase() in ComedyScriptGenerator.getBannedTopics())
+            assertTrue(bundle.conflict in ComedyScriptGenerator.CONFLICT_POOL)
+            assertTrue(bundle.actionStyle in ComedyScriptGenerator.ACTION_STYLES)
+            assertEquals("general", bundle.niche)
+            assertTrue(bundle.charactersSpec.contains("A = Aarav/MALE, B = Priya/FEMALE, C = none"))
+            assertTrue(bundle.systemPrompt.contains("3 GHANTE BAAD"))
+            assertTrue(bundle.systemPrompt.contains("TIME_SKIP_CARD"))
+            assertTrue(bundle.systemPrompt.contains("BONK_ENDING"))
+            assertTrue(bundle.systemPrompt.contains("COOKING_CHAI"))
+            assertTrue(bundle.systemPrompt.contains("DEADPAN"))
+            assertTrue(bundle.userPrompt.contains("primary_action_style: ${bundle.actionStyle}"))
+
+            // Second consecutive pick never repeats the same conflict or primary action style
+            val secondConflict = ComedyScriptGenerator.pickRandomConflict()
+            assertFalse("Consecutive conflict must differ", secondConflict == bundle.conflict)
+            val secondActionStyle = ComedyScriptGenerator.pickActionStyle(bundle.topic)
+            assertFalse("Consecutive action style must differ", secondActionStyle == bundle.actionStyle)
+
+            val jsonPayload = org.json.JSONObject().apply {
+                put("title", "Chai Bill Twist")
+                put("caption", "Bhai 20 rupaye ki chai mein 5 star drama #hinglish #chai #stickman #comedy")
+                put("lines", org.json.JSONArray().apply {
+                    put(org.json.JSONObject().apply {
+                        put("speaker", "A")
+                        put("line", "Bhai 500 ka note deke 10 ki chai kaun mangta hai?!")
+                        put("bubble", "500 KA NOTE?!")
+                        put("room", "KITCHEN")
+                        put("camera", "WIDE_DOORWAY")
+                        put("activity", "COOKING_CHAI")
+                        put("mood", "SHOCKED")
+                    })
+                    put(org.json.JSONObject().apply {
+                        put("speaker", "B")
+                        put("line", "Change nahi tha toh poori dukaan khareedne aaya hoon.")
+                        put("bubble", "DUKAAN KHARIDU KYA AB")
+                        put("room", "KITCHEN") // intentional consecutive duplicate -> should diversify
+                        put("camera", "WIDE_DOORWAY") // intentional duplicate -> should diversify
+                        put("activity", "COOKING_CHAI") // intentional duplicate -> should diversify
+                        put("mood", "SHOCKED") // intentional duplicate -> should diversify
+                    })
+                    put(org.json.JSONObject().apply {
+                        put("speaker", "A")
+                        put("line", "Mazaak mat kar, UPI scanner udhar deewar pe laga hai.")
+                        put("bubble", "UPI KAR BHAI")
+                        put("room", "COFFEE_SHOP")
+                        put("camera", "OVER_THE_SHOULDER")
+                        put("activity", "WALKING_IN")
+                        put("mood", "ANGRY")
+                    })
+                    put(org.json.JSONObject().apply {
+                        put("speaker", "B")
+                        put("line", "Acha idea hai, free sample bolke sabko chai baant dete hain!")
+                        put("bubble", "FREE CHAI PLAN")
+                        put("room", "OFFICE")
+                        put("camera", "DESK_SLAM")
+                        put("activity", "TALKING")
+                        put("mood", "SMUG")
+                    })
+                    put(org.json.JSONObject().apply {
+                        put("speaker", "TITLE")
+                        put("line", "3 GHANTE BAAD")
+                        put("bubble", "")
+                        put("room", "STREET_PARK")
+                        put("camera", "TIME_SKIP_CARD")
+                        put("activity", "TALKING")
+                        put("mood", "NEUTRAL")
+                    })
+                    put(org.json.JSONObject().apply {
+                        put("speaker", "B")
+                        put("line", "Scanner scan kiya par balance dekh ke phone hang ho gaya!")
+                        put("bubble", "BALANCE ZERO!")
+                        put("room", "COFFEE_SHOP")
+                        put("camera", "PROP_DROP")
+                        put("activity", "GAMING_PHONE")
+                        put("mood", "SWEATING")
+                    })
+                    put(org.json.JSONObject().apply {
+                        put("speaker", "A")
+                        put("line", "Chhod rehne de, kal se free chai subscription le lena.")
+                        put("bubble", "FREE SUBSCRIPTION!")
+                        put("room", "STREET_PARK")
+                        put("camera", "MEDIUM_TWO_SHOT")
+                        put("activity", "CLAPPING_CHEERING")
+                        put("mood", "DEADPAN")
+                    })
+                    put(org.json.JSONObject().apply {
+                        put("speaker", "B")
+                        put("line", "Plot twist — main hi iss dukaan ka naya malik hoon!")
+                        put("bubble", "NAYA MALIK!")
+                        put("room", "LIVING_ROOM")
+                        put("camera", "BONK_ENDING")
+                        put("activity", "DANCING")
+                        put("mood", "SMUG")
+                    })
+                })
+            }
+
+            val parsed = ComedyScriptGenerator.parseComedyScriptJson(
+                jsonText = jsonPayload.toString(),
+                niche = "general",
+                twist = "Jugaad gone wrong",
+                language = "Hinglish",
+                clonedSummary = "",
+                baseProject = base,
+                fallbackTopic = "Chai tapri"
+            )
+            assertEquals("Chai Bill Twist", parsed.title)
+            assertEquals(8, parsed.shots.size)
+            assertEquals(CameraFraming.TIME_SKIP_CARD, parsed.shots[4].framing)
+            assertEquals(SpeakerSlot.SILENT, parsed.shots[4].speaker)
+            assertEquals("3 GHANTE BAAD", parsed.shots[4].transitionCard)
+            assertTrue("Bubble must be max 4 words", parsed.shots.all {
+                it.speechBubble.trim().split(Regex("\\s+")).filter { w -> w.isNotBlank() }.size <= 4
+            })
+            assertEquals("NAYA MALIK!", parsed.shots.last().speechBubble)
+            assertEquals(4, parsed.hashtags.size)
+
+            // Verify consecutive spoken scenes differ in room, camera, activity, and mood + >= 4 rooms
+            val rooms = parsed.shots.mapNotNull { it.roomOverride }
+            assertTrue("Must use at least 4 distinct rooms (got ${rooms.distinct().size})", rooms.distinct().size >= 4)
+            val spoken = parsed.shots.filter { it.framing != CameraFraming.TIME_SKIP_CARD }
+            for (i in 1 until spoken.size) {
+                assertFalse("Consecutive spoken scenes must not repeat room", spoken[i].roomOverride == spoken[i - 1].roomOverride)
+                assertFalse("Consecutive spoken scenes must not repeat camera", spoken[i].framing == spoken[i - 1].framing)
+                assertFalse("Consecutive spoken scenes must not repeat activity", spoken[i].activity == spoken[i - 1].activity)
+                assertFalse("Consecutive spoken scenes must not repeat mood", spoken[i].moodPose == spoken[i - 1].moodPose)
+            }
+            assertTrue("Must not be plain standing-and-talking only", spoken.count { it.activity == CharacterActivity.TALKING } <= 1)
+            assertTrue("Generated topic added to banned history", "chai tapri" in ComedyScriptGenerator.getBannedTopics())
+        } finally {
+            ComedyScriptGenerator.clearHistory()
+        }
     }
 }
